@@ -237,7 +237,7 @@ def get_portals_endpoint(endpoint, params=None):
     if not PORTALS_API_KEY:
         return {"error": "portals_missing_key"}
 
-    query = "?" + urlencode(params or {}) if params else ""
+    query = "?" + urlencode(params or {}, doseq=True) if params else ""
     request = Request(
         PORTALS_API + endpoint + query,
         headers={
@@ -250,9 +250,13 @@ def get_portals_endpoint(endpoint, params=None):
     try:
         with urlopen(request, timeout=25) as response:
             body = response.read().decode("utf-8")
-            logger.info("PORTALS STATUS: %s", response.status)
-            logger.info("PORTALS RESPONSE: %s", body[:1000])
-            return json.loads(body)
+            payload = json.loads(body)
+            logger.info("PORTALS HTTP %s %s", response.status, endpoint)
+            if isinstance(payload, dict):
+                logger.info("PORTALS RESPONSE %s keys=%s", endpoint, sorted(payload.keys()))
+            else:
+                logger.info("PORTALS RESPONSE %s type=%s", endpoint, type(payload).__name__)
+            return payload
 
     except HTTPError as exc:
         try:
@@ -351,131 +355,6 @@ async def portals_search_number(number_value, collection=None):
 
 
 
-async def portals_fast_flip_scan(collection):
-    """
-    Снимок активных объявлений Portals.
-    TON и GRAM считаются одной единицей (1 TON = 1 GRAM).
-    Это оценка глубины предложения, а не подтверждённого оборота продаж.
-    """
-    if not PORTALS_API_KEY:
-        return {"error": "portals_missing_key"}
-
-    listings = []
-    offset = 0
-    max_pages = 3
-
-    for page in range(max_pages):
-        params = {
-            "name_filter": collection,
-            "limit": 100,
-            "offset": offset,
-            "sort_by": "price asc",
-            "status": "listed",
-        }
-        data = await asyncio.to_thread(get_portals_json, params)
-
-        if isinstance(data, dict) and data.get("error"):
-            return data
-        if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
-            return {"error": "portals_bad_response"}
-
-        page_items = data.get("results", [])
-        listings.extend(x for x in page_items if isinstance(x, dict))
-        offset += len(page_items)
-
-        total = data.get("total_count", 0)
-        if len(page_items) < 100 or (isinstance(total, int) and offset >= total):
-            break
-        if page < max_pages - 1:
-            await asyncio.sleep(1.05)
-
-    priced = []
-    skipped_currency = 0
-
-    for item in listings:
-        raw_price = item.get("price")
-        try:
-            price = Decimal(str(raw_price))
-            if not price.is_finite() or price <= 0:
-                continue
-        except (InvalidOperation, ValueError, TypeError):
-            continue
-
-        raw_currency = str(
-            item.get("currency") or item.get("price_currency") or "GRAM"
-        ).strip().upper()
-
-        # Portals отдаёт TON; в интерфейсе проекта это отображается как GRAM.
-        if raw_currency not in ("TON", "GRAM"):
-            skipped_currency += 1
-            continue
-
-        priced.append((price, "GRAM", item))
-
-    if not priced:
-        return {
-            "results": [],
-            "listing_count": len(listings),
-            "priced_count": 0,
-            "skipped_currency": skipped_currency,
-        }
-
-    prices = sorted(x[0] for x in priced)
-    floor = prices[0]
-    middle = len(prices) // 2
-
-    if len(prices) % 2:
-        median_price = prices[middle]
-    else:
-        median_price = (prices[middle - 1] + prices[middle]) / Decimal("2")
-
-    listing_spread = median_price - floor
-    listing_spread_pct = (
-        listing_spread / floor * Decimal("100")
-        if floor > 0 else Decimal("0")
-    )
-
-    # Глубина около флора: сколько лотов выставлено не дороже флора + 5% / 10%.
-    near_5_limit = floor * Decimal("1.05")
-    near_10_limit = floor * Decimal("1.10")
-    near_5 = sum(1 for value in prices if value <= near_5_limit)
-    near_10 = sum(1 for value in prices if value <= near_10_limit)
-
-    count = len(priced)
-    if count <= 5:
-        competition = "Низкая"
-    elif count <= 20:
-        competition = "Средняя"
-    else:
-        competition = "Высокая"
-
-    # Это только прокси ликвидности по глубине текущих объявлений.
-    if near_10 >= 10 and count >= 20:
-        liquidity = "Высокая глубина предложений"
-    elif near_10 >= 4:
-        liquidity = "Средняя глубина предложений"
-    else:
-        liquidity = "Низкая глубина предложений"
-
-    sample = sorted(priced, key=lambda x: x[0])[:5]
-
-    return {
-        "collection": collection,
-        "listing_count": len(listings),
-        "priced_count": count,
-        "skipped_currency": skipped_currency,
-        "currency": "GRAM",
-        "floor": floor,
-        "median": median_price,
-        "listing_spread": listing_spread,
-        "listing_spread_pct": listing_spread_pct,
-        "competition": competition,
-        "near_5": near_5,
-        "near_10": near_10,
-        "liquidity": liquidity,
-        "sample": sample,
-    }
-
 
 def decimal_value(value):
     try:
@@ -486,80 +365,198 @@ def decimal_value(value):
 
 
 async def portals_fast_flip_scan(budget):
-    """Bounded market-wide scan. Profit is estimated from recent collection purchases."""
+    """Market-wide FAST FLIP scan using Portals listings and market purchase feed.
+
+    The scanner is read-only. It never buys or lists NFTs. Profit is a conservative
+    estimate based on recent collection-level purchase prices, not an exact trait match.
+    """
     if not PORTALS_API_KEY:
         return {"error": "portals_missing_key"}
-    config = await asyncio.to_thread(get_portals_endpoint, "/market/config")
-    if config.get("error"): return config
-    await asyncio.sleep(1.05)
-    collections_data = await asyncio.to_thread(
-        get_portals_endpoint, "/collections/preview", {"sort_by": "name", "sort_order": "asc"}
-    )
-    if collections_data.get("error"): return collections_data
-    await asyncio.sleep(1.05)
-    collections = collections_data.get("collections", [])
-    collection_map = {str(c.get("id")): c for c in collections if isinstance(c, dict) and c.get("id")}
-    commission_default = decimal_value(config.get("commission"))
-    if commission_default is None: return {"error": "portals_bad_response"}
 
-    # Recent completed purchases, across all collections. API: max 20 per page, offset <= 700.
-    sales, sales_pages = [], 0
+    # 1) Market configuration: commission used for net resale estimate.
+    config = await asyncio.to_thread(get_portals_endpoint, "/market/config")
+    if not isinstance(config, dict) or config.get("error"):
+        return config if isinstance(config, dict) else {"error": "portals_bad_response"}
+
+    commission_default = decimal_value(config.get("commission"))
+    if commission_default is None or commission_default < 0 or commission_default >= 1:
+        logger.warning("FAST_FLIP invalid commission in market config: %r", config.get("commission"))
+        return {"error": "portals_bad_response"}
+
+    await asyncio.sleep(1.05)
+
+    # 2) Collection metadata: commission overrides and 24h volume.
+    collections_data = await asyncio.to_thread(
+        get_portals_endpoint,
+        "/collections/preview",
+        {"sort_by": "name", "sort_order": "asc"},
+    )
+    if not isinstance(collections_data, dict) or collections_data.get("error"):
+        return collections_data if isinstance(collections_data, dict) else {"error": "portals_bad_response"}
+
+    collections = collections_data.get("collections")
+    if not isinstance(collections, list):
+        logger.warning("FAST_FLIP collections response has no collections list")
+        return {"error": "portals_bad_response"}
+
+    collection_map = {
+        str(collection.get("id")): collection
+        for collection in collections
+        if isinstance(collection, dict) and collection.get("id")
+    }
+
+    await asyncio.sleep(1.05)
+
+    # 3) Recent market purchases. Portals documents action_types as string[].
+    # urlencode(..., doseq=True) sends it as a proper repeated query parameter.
+    sales = []
+    sales_pages = 0
+    action_type_counts = {}
     for page in range(FAST_FLIP_SALES_PAGES):
-        
-        data = await asyncio.to_thread(get_portals_endpoint, "/market/actions/", {
+        offset = page * 20
+        params = {
+            "action_types": ["purchase"],
             "period": "one_month",
             "limit": 20,
-            "offset": page * 20
-        })
+            "offset": offset,
+        }
+        data = await asyncio.to_thread(get_portals_endpoint, "/market/actions/", params)
+        if isinstance(data, dict) and data.get("error"):
+            return data
+        if not isinstance(data, dict):
+            logger.warning("FAST_FLIP market actions returned %s", type(data).__name__)
+            return {"error": "portals_bad_response"}
 
-        if data.get("error"): return data
-        actions = data.get("actions") if isinstance(data, dict) else None
-        if not isinstance(actions, list): return {"error": "portals_bad_response"}
+        actions = data.get("actions")
+        if not isinstance(actions, list):
+            # Defensive compatibility in case the API wraps the list differently.
+            actions = data.get("results")
+        if not isinstance(actions, list):
+            logger.warning("FAST_FLIP market actions response keys=%s", sorted(data.keys()))
+            return {"error": "portals_bad_response"}
+
         sales_pages += 1
-        sales.extend(a for a in actions if isinstance(a, dict) and a.get("type") == "purchase")
-        if len(actions) < 20: break
-        if page < FAST_FLIP_SALES_PAGES - 1: await asyncio.sleep(1.05)
+        page_purchases = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_type = str(action.get("type") or action.get("action_type") or "unknown").strip().lower()
+            action_type_counts[action_type] = action_type_counts.get(action_type, 0) + 1
+            if action_type == "purchase":
+                page_purchases.append(action)
 
+        sales.extend(page_purchases)
+        first = actions[0] if actions else {}
+        first_nft = first.get("nft") if isinstance(first, dict) else {}
+        logger.info(
+            "FAST_FLIP market_actions page=%s offset=%s returned=%s purchases=%s types=%s first_action_keys=%s first_nft_keys=%s",
+            page + 1,
+            offset,
+            len(actions),
+            len(page_purchases),
+            action_type_counts,
+            sorted(first.keys()) if isinstance(first, dict) else [],
+            sorted(first_nft.keys()) if isinstance(first_nft, dict) else [],
+        )
+
+        if len(actions) < 20:
+            break
+        if page < FAST_FLIP_SALES_PAGES - 1:
+            await asyncio.sleep(1.05)
+
+    # 4) Aggregate purchase prices by collection.
     sold_by_collection = {}
     for action in sales:
-        nft = action.get("nft") or {}
+        nft = action.get("nft") if isinstance(action.get("nft"), dict) else {}
+        collection_obj = action.get("collection") if isinstance(action.get("collection"), dict) else {}
+        nft_collection = nft.get("collection") if isinstance(nft.get("collection"), dict) else {}
+        collection_id = (
+            action.get("collection_id")
+            or nft.get("collection_id")
+            or collection_obj.get("id")
+            or nft_collection.get("id")
+        )
         amount = decimal_value(action.get("amount"))
-        cid = nft.get("collection_id") if isinstance(nft, dict) else None
-        if cid and amount and amount > 0:
-            sold_by_collection.setdefault(str(cid), []).append(amount)
+        if collection_id and amount is not None and amount > 0:
+            sold_by_collection.setdefault(str(collection_id), []).append(amount)
 
     await asyncio.sleep(1.05)
-    listings, listing_pages, total_hint = [], 0, 0
-    for page in range(FAST_FLIP_LISTING_PAGES):
-        data = await asyncio.to_thread(get_portals_json, {
-            "status": "listed", "max_price": str(budget), "sort_by": "price asc",
-            "limit": 100, "offset": page * 100
-        })
-        if data.get("error"): return data
-        items = data.get("results") if isinstance(data, dict) else None
-        if not isinstance(items, list): return {"error": "portals_bad_response"}
-        listing_pages += 1
-        listings.extend(x for x in items if isinstance(x, dict))
-        total_hint = data.get("total_count", len(listings))
-        if len(items) < 100 or (isinstance(total_hint, int) and (page + 1) * 100 >= total_hint): break
-        if page < FAST_FLIP_LISTING_PAGES - 1: await asyncio.sleep(1.05)
 
-    candidates, no_sales, low_profit, no_volume = [], 0, 0, 0
+    # 5) Current listings within the user's budget.
+    listings = []
+    listing_pages = 0
+    total_hint = 0
+    for page in range(FAST_FLIP_LISTING_PAGES):
+        offset = page * 100
+        params = {
+            "status": "listed",
+            "max_price": str(budget),
+            "sort_by": "price asc",
+            "limit": 100,
+            "offset": offset,
+        }
+        data = await asyncio.to_thread(get_portals_json, params)
+        if isinstance(data, dict) and data.get("error"):
+            return data
+        if not isinstance(data, dict):
+            return {"error": "portals_bad_response"}
+
+        items = data.get("results")
+        if not isinstance(items, list):
+            logger.warning("FAST_FLIP NFT search response keys=%s", sorted(data.keys()))
+            return {"error": "portals_bad_response"}
+
+        listing_pages += 1
+        listings.extend(item for item in items if isinstance(item, dict))
+        total_hint = data.get("total_count", len(listings))
+        logger.info(
+            "FAST_FLIP listings page=%s offset=%s returned=%s total_hint=%s",
+            page + 1, offset, len(items), total_hint,
+        )
+        if len(items) < 100 or (isinstance(total_hint, int) and (page + 1) * 100 >= total_hint):
+            break
+        if page < FAST_FLIP_LISTING_PAGES - 1:
+            await asyncio.sleep(1.05)
+
+    # 6) Evaluate candidates. Require >=2 recent purchases and positive 24h volume.
+    candidates = []
+    no_sales = 0
+    low_profit = 0
+    no_volume = 0
+    missing_collection = 0
+    invalid_listing = 0
+
     for item in listings:
         price = decimal_value(item.get("price"))
-        cid = str(item.get("collection_id") or "")
-        if item.get("status") != "listed" or not price or price <= 0 or price > budget or not cid:
+        collection_id = str(item.get("collection_id") or "")
+        if (
+            item.get("status") != "listed"
+            or price is None
+            or price <= 0
+            or price > budget
+        ):
+            invalid_listing += 1
             continue
-        sold = sold_by_collection.get(cid, [])
+        if not collection_id:
+            missing_collection += 1
+            continue
+
+        sold = sold_by_collection.get(collection_id, [])
         if len(sold) < 2:
             no_sales += 1
             continue
-        collection = collection_map.get(cid, {})
+
+        collection = collection_map.get(collection_id, {})
         day_volume = decimal_value(collection.get("day_volume"))
         if day_volume is None or day_volume <= 0:
             no_volume += 1
             continue
-        commission = Decimal("0") if collection.get("zero_commission") else commission_default
+
+        commission = (
+            Decimal("0")
+            if collection.get("zero_commission")
+            else commission_default
+        )
         median_sale = Decimal(str(median(sold)))
         conservative_sale = median_sale * (Decimal("1") - FAST_FLIP_SALE_HAIRCUT)
         net_sale = conservative_sale * (Decimal("1") - commission)
@@ -567,13 +564,40 @@ async def portals_fast_flip_scan(budget):
         if profit < FAST_FLIP_MIN_PROFIT:
             low_profit += 1
             continue
-        candidates.append({"item": item, "collection": collection, "buy": price,
-            "median_sale": median_sale, "net_sale": net_sale, "commission": commission,
-            "profit": profit, "sales_count": len(sold), "day_volume": day_volume})
-    candidates.sort(key=lambda x: x["profit"], reverse=True)
-    return {"candidates": candidates[:20], "listing_count": len(listings),
-        "sales_count": len(sales), "sales_pages": sales_pages, "listing_pages": listing_pages,
-        "total_hint": total_hint, "no_sales": no_sales, "low_profit": low_profit, "no_volume": no_volume}
+
+        candidates.append({
+            "item": item,
+            "collection": collection,
+            "buy": price,
+            "median_sale": median_sale,
+            "net_sale": net_sale,
+            "commission": commission,
+            "profit": profit,
+            "sales_count": len(sold),
+            "day_volume": day_volume,
+        })
+
+    candidates.sort(key=lambda candidate: candidate["profit"], reverse=True)
+    logger.info(
+        "FAST_FLIP summary listings=%s purchase_events=%s sales_pages=%s listing_pages=%s collections=%s type_counts=%s candidates=%s",
+        len(listings), len(sales), sales_pages, listing_pages, len(collection_map),
+        action_type_counts, len(candidates),
+    )
+
+    return {
+        "candidates": candidates[:20],
+        "listing_count": len(listings),
+        "sales_count": len(sales),
+        "sales_pages": sales_pages,
+        "listing_pages": listing_pages,
+        "total_hint": total_hint,
+        "no_sales": no_sales,
+        "low_profit": low_profit,
+        "no_volume": no_volume,
+        "missing_collection": missing_collection,
+        "invalid_listing": invalid_listing,
+        "action_type_counts": action_type_counts,
+    }
 
 
 async def show_fast_flip(update, budget):
@@ -588,6 +612,7 @@ async def show_fast_flip(update, budget):
         f"🔎 Получено объявлений: {data['listing_count']}",
         f"🧾 Покупок за 30 дней в выборке: {data['sales_count']}",
         f"📄 Страниц объявлений / покупок: {data['listing_pages']} / {data['sales_pages']}",
+        f"🧾 Покупок в ленте: {data['sales_count']}",
         f"🎯 Минимальная расчётная прибыль: +{number(FAST_FLIP_MIN_PROFIT)} GRAM", ""]
     if not data["candidates"]:
         lines.append("Подходящих вариантов в проверенной выборке не найдено.")
@@ -610,6 +635,7 @@ async def show_fast_flip(update, budget):
                 lines.append(f"   Telegram: https://t.me/nft/{quote(tg_id, safe='_-')}")
     lines.extend(["", f"⏭️ Без 2+ покупок в выборке: {data['no_sales']}",
         f"⏭️ Без подтверждённого объёма за 24 ч: {data['no_volume']}",
+        f"⏭️ Без ID коллекции: {data['missing_collection']}",
         f"⏭️ Ниже порога прибыли: {data['low_profit']}", "",
         "⚠️ Прибыль ориентировочная: используется медиана покупок всей коллекции, а не точное совпадение модели/фона/символа. К медиане применена скидка 5% и комиссия продавца. Это не гарантированная цена перепродажи.",
         "Охват ограничен FAST_FLIP_LISTING_PAGES и FAST_FLIP_SALES_PAGES. Перед покупкой проверь атрибуты, unlocks_at и актуальную цену."])
