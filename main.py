@@ -28,7 +28,7 @@ from telegram.ext import (
 # =====================================
 
 PRODUCT_NAME = "GIFTS HUNTER"
-PRODUCT_VERSION = "1.0.3"
+PRODUCT_VERSION = "1.1.0"
 
 TOKEN = os.getenv("BOT_TOKEN")
 API = "https://starprice.net/api/v1/gifts"
@@ -37,6 +37,10 @@ PORTALS_API_KEY = os.getenv("PORTALS_API_KEY")
 # Keep the legacy default filename to preserve existing history and alerts.
 DB_PATH = os.getenv("DB_PATH", "tonhunter.db")
 CHECK_INTERVAL = 300
+FAST_FLIP_MIN_PROFIT = Decimal(os.getenv("FAST_FLIP_MIN_PROFIT", "2"))
+FAST_FLIP_LISTING_PAGES = max(1, min(20, int(os.getenv("FAST_FLIP_LISTING_PAGES", "10"))))
+FAST_FLIP_SALES_PAGES = max(1, min(35, int(os.getenv("FAST_FLIP_SALES_PAGES", "5"))))
+FAST_FLIP_SALE_HAIRCUT = Decimal(os.getenv("FAST_FLIP_SALE_HAIRCUT", "0.05"))
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -227,41 +231,35 @@ def api_path(gift, model=None):
 # PORTALS SEARCH BY GIFT NUMBER
 # =====================================
 
-def get_portals_json(params):
+def get_portals_endpoint(endpoint, params=None):
+    """GET helper for authenticated Portals Partner API endpoints."""
     if not PORTALS_API_KEY:
         return {"error": "portals_missing_key"}
-
-    url = PORTALS_API + "/nfts/search?" + urlencode(params)
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "GiftsHunter/1.0.1",
-            "Accept": "application/json",
-            "Authorization": f"partners {PORTALS_API_KEY}",
-        },
-    )
-
+    query = "?" + urlencode(params or {}) if params else ""
+    request = Request(PORTALS_API + endpoint + query, headers={
+        "User-Agent": f"GiftsHunter/{PRODUCT_VERSION}",
+        "Accept": "application/json",
+        "Authorization": f"partners {PORTALS_API_KEY}",
+    })
     try:
         with urlopen(request, timeout=25) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            payload = {}
-
+        try: payload = json.loads(exc.read().decode("utf-8"))
+        except Exception: payload = {}
         code = payload.get("code", "")
-        if exc.code == 401:
-            return {"error": "portals_auth"}
-        if exc.code == 403:
-            return {"error": "portals_access", "details": payload.get("message", code)}
-        if exc.code == 429:
-            return {"error": "portals_rate_limit"}
-        logger.warning("Portals HTTP %s: %s", exc.code, payload)
-        return {"error": "portals_api"}
+        if exc.code == 401: return {"error": "portals_auth"}
+        if exc.code == 403: return {"error": "portals_access", "details": payload.get("message", code)}
+        if exc.code == 429: return {"error": "portals_rate_limit"}
+        logger.warning("Portals HTTP %s at %s: %s", exc.code, endpoint, payload)
+        return {"error": "portals_api", "details": payload.get("message", code)}
     except (URLError, TimeoutError, ValueError, OSError):
-        logger.exception("Portals connection error")
+        logger.exception("Portals connection error at %s", endpoint)
         return {"error": "portals_connection"}
+
+
+def get_portals_json(params):
+    return get_portals_endpoint("/nfts/search", params)
 
 
 async def portals_search_number(number_value, collection=None):
@@ -450,86 +448,140 @@ async def portals_fast_flip_scan(collection):
     }
 
 
-async def show_fast_flip(update, collection):
-    await update.message.reply_text(
-        f"⚡ Сканирую активные объявления Portals: {collection}..."
+def decimal_value(value):
+    try:
+        result = Decimal(str(value))
+        return result if result.is_finite() else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+async def portals_fast_flip_scan(budget):
+    """Bounded market-wide scan. Profit is estimated from recent collection purchases."""
+    if not PORTALS_API_KEY:
+        return {"error": "portals_missing_key"}
+    config = await asyncio.to_thread(get_portals_endpoint, "/market/config")
+    if config.get("error"): return config
+    await asyncio.sleep(1.05)
+    collections_data = await asyncio.to_thread(
+        get_portals_endpoint, "/collections/preview", {"sort_by": "name", "sort_order": "asc"}
     )
-    data = await portals_fast_flip_scan(collection)
+    if collections_data.get("error"): return collections_data
+    await asyncio.sleep(1.05)
+    collections = collections_data.get("collections", [])
+    collection_map = {str(c.get("id")): c for c in collections if isinstance(c, dict) and c.get("id")}
+    commission_default = decimal_value(config.get("commission"))
+    if commission_default is None: return {"error": "portals_bad_response"}
 
-    if isinstance(data, dict) and data.get("error"):
-        if data["error"] == "portals_mixed_currency":
-            await update.message.reply_text(
-                "⚠️ Не удалось привести валюты объявлений к GRAM.",
-                reply_markup=menu(),
-            )
-        else:
-            await update.message.reply_text(
-                portals_error_message(data["error"]), reply_markup=menu()
-            )
+    # Recent completed purchases, across all collections. API: max 20 per page, offset <= 700.
+    sales, sales_pages = [], 0
+    for page in range(FAST_FLIP_SALES_PAGES):
+        data = await asyncio.to_thread(get_portals_endpoint, "/market/actions/", {
+            "action_types": "purchase", "period": "one_month", "limit": 20, "offset": page * 20
+        })
+        if data.get("error"): return data
+        actions = data.get("actions") if isinstance(data, dict) else None
+        if not isinstance(actions, list): return {"error": "portals_bad_response"}
+        sales_pages += 1
+        sales.extend(a for a in actions if isinstance(a, dict) and a.get("type") == "purchase")
+        if len(actions) < 20: break
+        if page < FAST_FLIP_SALES_PAGES - 1: await asyncio.sleep(1.05)
+
+    sold_by_collection = {}
+    for action in sales:
+        nft = action.get("nft") or {}
+        amount = decimal_value(action.get("amount"))
+        cid = nft.get("collection_id") if isinstance(nft, dict) else None
+        if cid and amount and amount > 0:
+            sold_by_collection.setdefault(str(cid), []).append(amount)
+
+    await asyncio.sleep(1.05)
+    listings, listing_pages, total_hint = [], 0, 0
+    for page in range(FAST_FLIP_LISTING_PAGES):
+        data = await asyncio.to_thread(get_portals_json, {
+            "status": "listed", "max_price": str(budget), "sort_by": "price asc",
+            "limit": 100, "offset": page * 100
+        })
+        if data.get("error"): return data
+        items = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(items, list): return {"error": "portals_bad_response"}
+        listing_pages += 1
+        listings.extend(x for x in items if isinstance(x, dict))
+        total_hint = data.get("total_count", len(listings))
+        if len(items) < 100 or (isinstance(total_hint, int) and (page + 1) * 100 >= total_hint): break
+        if page < FAST_FLIP_LISTING_PAGES - 1: await asyncio.sleep(1.05)
+
+    candidates, no_sales, low_profit, no_volume = [], 0, 0, 0
+    for item in listings:
+        price = decimal_value(item.get("price"))
+        cid = str(item.get("collection_id") or "")
+        if item.get("status") != "listed" or not price or price <= 0 or price > budget or not cid:
+            continue
+        sold = sold_by_collection.get(cid, [])
+        if len(sold) < 2:
+            no_sales += 1
+            continue
+        collection = collection_map.get(cid, {})
+        day_volume = decimal_value(collection.get("day_volume"))
+        if day_volume is None or day_volume <= 0:
+            no_volume += 1
+            continue
+        commission = Decimal("0") if collection.get("zero_commission") else commission_default
+        median_sale = Decimal(str(median(sold)))
+        conservative_sale = median_sale * (Decimal("1") - FAST_FLIP_SALE_HAIRCUT)
+        net_sale = conservative_sale * (Decimal("1") - commission)
+        profit = net_sale - price
+        if profit < FAST_FLIP_MIN_PROFIT:
+            low_profit += 1
+            continue
+        candidates.append({"item": item, "collection": collection, "buy": price,
+            "median_sale": median_sale, "net_sale": net_sale, "commission": commission,
+            "profit": profit, "sales_count": len(sold), "day_volume": day_volume})
+    candidates.sort(key=lambda x: x["profit"], reverse=True)
+    return {"candidates": candidates[:20], "listing_count": len(listings),
+        "sales_count": len(sales), "sales_pages": sales_pages, "listing_pages": listing_pages,
+        "total_hint": total_hint, "no_sales": no_sales, "low_profit": low_profit, "no_volume": no_volume}
+
+
+async def show_fast_flip(update, budget):
+    await update.message.reply_text(
+        f"⚡ Сканирую каталог Portals в пределах {number(budget)} GRAM. Это может занять некоторое время..."
+    )
+    data = await portals_fast_flip_scan(budget)
+    if data.get("error"):
+        await update.message.reply_text(portals_error_message(data["error"]), reply_markup=menu())
         return
-
-    if not data.get("priced_count"):
-        await update.message.reply_text(
-            f"По коллекции «{collection}» не найдено активных объявлений "
-            "с ценой в GRAM.",
-            reply_markup=menu(),
-        )
-        return
-
-    floor = data["floor"]
-    med = data["median"]
-    spread = data["listing_spread"]
-    pct = data["listing_spread_pct"]
-
-    if pct >= Decimal("5"):
-        signal = "🟢 Разрыв больше 5% — стоит проверить самый дешёвый лот"
-    elif pct > 0:
-        signal = "🟡 Небольшой разрыв — проверь комиссии и спрос"
+    lines = ["⚡ FAST FLIP — ГЛОБАЛЬНЫЙ СКАНЕР", f"💳 Бюджет: до {number(budget)} GRAM",
+        f"🔎 Получено объявлений: {data['listing_count']}",
+        f"🧾 Покупок за 30 дней в выборке: {data['sales_count']}",
+        f"📄 Страниц объявлений / покупок: {data['listing_pages']} / {data['sales_pages']}",
+        f"🎯 Минимальная расчётная прибыль: +{number(FAST_FLIP_MIN_PROFIT)} GRAM", ""]
+    if not data["candidates"]:
+        lines.append("Подходящих вариантов в проверенной выборке не найдено.")
     else:
-        signal = "🔴 Выраженного ценового разрыва нет"
+        lines.append("🏆 ЛУЧШИЕ ВАРИАНТЫ:")
+        for i, c in enumerate(data["candidates"], 1):
+            item, collection = c["item"], c["collection"]
+            name = item.get("name") or collection.get("name") or "Подарок"
+            no = item.get("external_collection_number")
+            lines.extend([f"\n{i}. {name}{f' №{no}' if no is not None else ''}",
+                f"   Покупка: {number(c['buy'])} GRAM",
+                f"   Медиана покупок коллекции: {number(c['median_sale'])} GRAM",
+                f"   Чистая оценка продажи после скидки 5% и комиссии: {number(c['net_sale'])} GRAM",
+                f"   Расчётная прибыль: +{number(c['profit'])} GRAM",
+                f"   Покупок в выборке: {c['sales_count']}",
+                f"   Объём коллекции за 24 ч: {number(c['day_volume'])} GRAM",
+                f"   Комиссия продажи: {number(c['commission'] * 100, 2)}%"])
+            tg_id = item.get("tg_id")
+            if isinstance(tg_id, str) and re.fullmatch(r"[A-Za-z0-9_-]+", tg_id):
+                lines.append(f"   Telegram: https://t.me/nft/{quote(tg_id, safe='_-')}")
+    lines.extend(["", f"⏭️ Без 2+ покупок в выборке: {data['no_sales']}",
+        f"⏭️ Без подтверждённого объёма за 24 ч: {data['no_volume']}",
+        f"⏭️ Ниже порога прибыли: {data['low_profit']}", "",
+        "⚠️ Прибыль ориентировочная: используется медиана покупок всей коллекции, а не точное совпадение модели/фона/символа. К медиане применена скидка 5% и комиссия продавца. Это не гарантированная цена перепродажи.",
+        "Охват ограничен FAST_FLIP_LISTING_PAGES и FAST_FLIP_SALES_PAGES. Перед покупкой проверь атрибуты, unlocks_at и актуальную цену."])
+    await update.message.reply_text("\n".join(lines), reply_markup=menu(), disable_web_page_preview=True)
 
-    lines = [
-        f"⚡ FAST FLIP + LIQUIDITY — {collection}",
-        "",
-        f"📋 Активных объявлений получено: {data['listing_count']}",
-        f"💰 Минимальная цена: {number(floor)} GRAM",
-        f"📊 Медианная цена: {number(med)} GRAM",
-        f"📈 Разница медиана/минимум: {number(spread)} GRAM ({number(pct, 2)}%)",
-        "",
-        f"🥊 Конкуренция: {data['competition']}",
-        f"💧 Ликвидность по глубине объявлений: {data['liquidity']}",
-        f"📦 Лотов в пределах +5% от флора: {data['near_5']}",
-        f"📦 Лотов в пределах +10% от флора: {data['near_10']}",
-        "",
-        signal,
-        "",
-        "Пять самых дешёвых объявлений:",
-    ]
-
-    for price, _, item in data["sample"]:
-        name = item.get("name") or collection
-        item_number = item.get("external_collection_number")
-        suffix = f" №{item_number}" if item_number is not None else ""
-        lines.append(f"• {name}{suffix} — {number(price)} GRAM")
-
-    if data.get("skipped_currency"):
-        lines.extend([
-            "",
-            f"ℹ️ Пропущено объявлений в другой валюте: {data['skipped_currency']}",
-        ])
-
-    lines.extend([
-        "",
-        "⚠️ Важно: это анализ активных объявлений Portals, а не завершённых продаж.",
-        "Глубина объявлений — лишь косвенный показатель ликвидности.",
-        "Для настоящей ликвидности нужны объём и скорость завершённых продаж.",
-        "Разница между медианой и флором не является гарантированной прибылью.",
-        "Перед покупкой проверь сам лот, комиссии и возможность перепродажи.",
-    ])
-
-    await update.message.reply_text(
-        "\n".join(lines), reply_markup=menu(), disable_web_page_preview=True
-    )
 
 def portals_error_message(error):
     messages = {
@@ -1346,12 +1398,11 @@ async def buttons(update, context):
             "Пример: Plush Pepe / Frozen"
         ),
         "fast_flip": (
-            "fast_flip",
-            "⚡ FAST FLIP + LIQUIDITY SCANNER\n\n"
-            "Напиши название коллекции для анализа активных объявлений Portals.\n"
-            "Пример: Plush Pepe\n\n"
-            "Будут рассчитаны минимум, медиана, число конкурирующих объявлений "
-            "и разницу между медианной и минимальной ценой."
+            "fast_flip_budget",
+            "⚡ FAST FLIP — ГЛОБАЛЬНЫЙ СКАНЕР\n\n"
+            "Отправь максимальный бюджет покупки в GRAM.\n"
+            "Например: 100\n\n"
+            "Минимальная расчётная чистая прибыль — +2 GRAM."
         ),
         "rare": (
             "rare",
@@ -1402,6 +1453,15 @@ async def text_handler(update, context):
     if mode == "alert":
         context.user_data["mode"] = None
         await create_alert_from_text(update, text)
+        return
+
+    if mode == "fast_flip_budget":
+        budget = decimal_value(text.replace(" ", "").replace(",", "."))
+        if budget is None or budget <= 0:
+            await update.message.reply_text("Укажи положительный бюджет в GRAM. Например: 100")
+            return
+        context.user_data["mode"] = None
+        await show_fast_flip(update, budget)
         return
 
     if mode == "portals_number":
