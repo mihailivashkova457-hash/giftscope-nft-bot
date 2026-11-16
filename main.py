@@ -505,9 +505,13 @@ async def portals_fast_flip_scan(budget):
     # Recent completed purchases, across all collections. API: max 20 per page, offset <= 700.
     sales, sales_pages = [], 0
     for page in range(FAST_FLIP_SALES_PAGES):
+        
         data = await asyncio.to_thread(get_portals_endpoint, "/market/actions/", {
-            "action_types": "purchase", "period": "one_month", "limit": 20, "offset": page * 20
+            "period": "one_month",
+            "limit": 20,
+            "offset": page * 20
         })
+
         if data.get("error"): return data
         actions = data.get("actions") if isinstance(data, dict) else None
         if not isinstance(actions, list): return {"error": "portals_bad_response"}
