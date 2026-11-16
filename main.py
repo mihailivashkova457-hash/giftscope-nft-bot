@@ -243,7 +243,12 @@ def get_portals_endpoint(endpoint, params=None):
     })
     try:
         with urlopen(request, timeout=25) as response:
-            return json.loads(response.read().decode("utf-8"))
+    body = response.read().decode("utf-8")
+
+    logger.info("PORTALS STATUS: %s", response.status)
+    logger.info("PORTALS RESPONSE: %s", body[:2000])
+
+    return json.loads(body)
     except HTTPError as exc:
         try: payload = json.loads(exc.read().decode("utf-8"))
         except Exception: payload = {}
