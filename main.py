@@ -62,10 +62,19 @@ async def api_request(path=""):
         return {"error": "connection"}
 
 
+
 def money(value, currency):
     if value is None:
         return "нет данных"
-    return f"{value:g} {currency}"
+
+    try:
+        number = float(value)
+        formatted = f"{number:,.2f}".rstrip("0").rstrip(".")
+        formatted = formatted.replace(",", " ").replace(".", ",")
+        return f"{formatted} {currency}".strip()
+    except (ValueError, TypeError):
+        return f"{value} {currency}".strip()
+
 
 
 def floor_text(floor):
@@ -76,7 +85,7 @@ def floor_text(floor):
     rub = floor.get("rub")
 
     if rub is not None:
-        result += f" (≈ {rub} ₽)"
+        result += f" (≈ {money(rub, '₽')})"
 
     return result
 
@@ -102,7 +111,7 @@ def offers_text(offers):
 
         rub = offer.get("rub")
         if rub is not None:
-            price += f" (≈ {rub} ₽)"
+            result += f" (≈ {money(rub, '₽')})"
 
         lines.append(f"• {market}: {price}")
 
