@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import os
 import json
+import re
 import logging
 import asyncio
 import sqlite3
@@ -368,20 +369,27 @@ async def show_portals_number_search(update, number_value, collection=None):
         f"Коллекция: {collection or 'все коллекции'}\n"
         f"Найдено: {len(results)}"
     )
-    lines = [heading]
+    await update.message.reply_text(
+        heading,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 Открыть маркет Portals", url="https://portals.tg/")]
+        ]),
+        disable_web_page_preview=True,
+    )
 
     for item in results[:20]:
         name = item.get("name", "Без названия")
         status = item.get("status", "неизвестно")
         price = item.get("price")
         floor_price = item.get("floor_price")
+        item_number = item.get("external_collection_number", number_value)
 
-        lines.append(
-            f"\n• {name} №{item.get('external_collection_number', number_value)}"
-            f"\n  Цена: {money(price, 'GRAM') if price is not None else 'не выставлен'}"
-            f"\n  Флор коллекции: {money(floor_price, 'GRAM')}"
-            f"\n  Статус: {status}"
-        )
+        caption_lines = [
+            f"🎁 {name} №{item_number}",
+            f"💰 Цена: {money(price, 'GRAM') if price is not None else 'не выставлен'}",
+            f"📉 Флор коллекции: {money(floor_price, 'GRAM')}",
+            f"📌 Статус: {status}",
+        ]
 
         attributes = item.get("attributes", [])
         if isinstance(attributes, list):
@@ -391,13 +399,41 @@ async def show_portals_number_search(update, number_value, collection=None):
                 attr_name = attribute.get("type") or attribute.get("name") or "Атрибут"
                 attr_value = attribute.get("value") or attribute.get("name_value")
                 if attr_value:
-                    lines.append(f"  {attr_name}: {attr_value}")
+                    caption_lines.append(f"• {attr_name}: {attr_value}")
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=menu(),
-        disable_web_page_preview=True,
-    )
+        tg_id = item.get("tg_id")
+        buttons = []
+        if isinstance(tg_id, str) and tg_id.strip():
+            # Telegram gift deep links use the gift slug/identifier returned by Portals.
+            safe_tg_id = tg_id.strip()
+            if re.fullmatch(r"[A-Za-z0-9_-]+", safe_tg_id):
+                buttons.append(InlineKeyboardButton(
+                    "🎁 Открыть подарок в Telegram",
+                    url=f"https://t.me/nft/{quote(safe_tg_id, safe='_-')}"
+                ))
+
+        reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+        photo_url = item.get("photo_url")
+        caption = "\n".join(caption_lines)
+
+        if isinstance(photo_url, str) and photo_url.startswith(("https://", "http://")):
+            try:
+                await update.message.reply_photo(
+                    photo=photo_url,
+                    caption=caption[:1024],
+                    reply_markup=reply_markup,
+                )
+                continue
+            except Exception:
+                logger.warning("Could not send Portals gift photo; falling back to text", exc_info=True)
+
+        await update.message.reply_text(
+            caption,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+
+    await update.message.reply_text("Готово. Выбери следующий поиск или вернись в меню:", reply_markup=menu())
 
 
 # =====================================
