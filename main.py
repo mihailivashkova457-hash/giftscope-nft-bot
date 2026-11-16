@@ -275,7 +275,7 @@ def get_portals_endpoint(endpoint, params=None):
 
         api_code = str(payload.get("code") or "")
         api_message = str(payload.get("message") or payload.get("detail") or raw_body or "")
-        details = f"HTTP {exc.code}"
+        details = f"HTTP {exc.code} at {endpoint}"
         if api_code:
             details += f" / {api_code}"
         if api_message:
@@ -427,8 +427,10 @@ async def portals_fast_flip_scan(budget):
     action_type_counts = {}
     for page in range(FAST_FLIP_SALES_PAGES):
         offset = page * 20
+        # Fetch the documented market feed without the action_types query filter.
+        # Some Portals deployments reject the repeated-array encoding with HTTP 422.
+        # Purchases are filtered locally below, so this does not change scan logic.
         params = {
-            "action_types": ["purchase"],
             "period": "one_month",
             "limit": 20,
             "offset": offset,
@@ -671,7 +673,7 @@ def portals_error_message(error, details=None):
         ),
         "portals_connection": "⚠️ Не удалось подключиться к Portals.",
         "portals_api": "⚠️ Ошибка Portals API.",
-        "portals_bad_request": "⚠️ Portals отклонил параметры запроса (422). Проверь логи Railway.",
+        "portals_bad_request": "⚠️ Portals отклонил параметры запроса (422). В диагностике указан endpoint и причина.",
         "portals_feed_unavailable": "⏳ Лента покупок Portals временно недоступна (503). Попробуй позже.",
         "portals_unavailable": "⏳ Portals временно недоступен (503). Попробуй позже.",
         "portals_server_error": "⚠️ Внутренняя ошибка серверов Portals (5xx). Попробуй позже.",
