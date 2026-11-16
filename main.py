@@ -5,6 +5,7 @@ import re
 import logging
 import asyncio
 import sqlite3
+from statistics import median
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -318,6 +319,169 @@ async def portals_search_number(number_value, collection=None):
     return {"results": found[:20], "total_count": len(found)}
 
 
+
+async def portals_fast_flip_scan(collection):
+    """Analyse current Portals listings for one collection.
+
+    This is a listing-based price/competition snapshot, not confirmed sales
+    data and not a prediction that an item will sell within 72 hours.
+    """
+    if not PORTALS_API_KEY:
+        return {"error": "portals_missing_key"}
+
+    listings = []
+    offset = 0
+    max_pages = 3
+
+    for page in range(max_pages):
+        params = {
+            "name_filter": collection,
+            "limit": 100,
+            "offset": offset,
+            "sort_by": "price asc",
+            "status": "listed",
+        }
+        data = await asyncio.to_thread(get_portals_json, params)
+        if isinstance(data, dict) and data.get("error"):
+            return data
+        if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
+            return {"error": "portals_bad_response"}
+
+        page_items = data.get("results", [])
+        listings.extend(x for x in page_items if isinstance(x, dict))
+        offset += len(page_items)
+        total = data.get("total_count", 0)
+        if len(page_items) < 100 or (isinstance(total, int) and offset >= total):
+            break
+        if page < max_pages - 1:
+            await asyncio.sleep(1.05)
+
+    priced = []
+    for item in listings:
+        raw_price = item.get("price")
+        try:
+            price = Decimal(str(raw_price))
+            if not price.is_finite() or price <= 0:
+                continue
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        currency = str(item.get("currency") or item.get("price_currency") or "TON").upper()
+        priced.append((price, currency, item))
+
+    if not priced:
+        return {"results": [], "listing_count": len(listings), "priced_count": 0}
+
+    currencies = {x[1] for x in priced}
+    if len(currencies) != 1:
+        return {
+            "error": "portals_mixed_currency",
+            "listing_count": len(listings),
+            "priced_count": len(priced),
+        }
+
+    prices = sorted(x[0] for x in priced)
+    floor = prices[0]
+    median_price = Decimal(str(median([float(x) for x in prices])))
+    # A conservative asking-price target; it is not a 72-hour sale forecast.
+    target_72h = median_price * Decimal("0.95")
+    gross_spread = target_72h - floor
+    gross_pct = (gross_spread / floor * Decimal("100")) if floor > 0 else Decimal("0")
+
+    count = len(priced)
+    if count <= 5:
+        competition = "Низкая"
+    elif count <= 20:
+        competition = "Средняя"
+    else:
+        competition = "Высокая"
+
+    sample = sorted(priced, key=lambda x: x[0])[:5]
+    return {
+        "collection": collection,
+        "listing_count": len(listings),
+        "priced_count": count,
+        "currency": next(iter(currencies)),
+        "floor": floor,
+        "median": median_price,
+        "target_72h": target_72h,
+        "gross_spread": gross_spread,
+        "gross_pct": gross_pct,
+        "competition": competition,
+        "sample": sample,
+    }
+
+
+async def show_fast_flip(update, collection):
+    await update.message.reply_text(
+        f"⚡ Сканирую активные объявления Portals: {collection}..."
+    )
+    data = await portals_fast_flip_scan(collection)
+
+    if isinstance(data, dict) and data.get("error"):
+        if data["error"] == "portals_mixed_currency":
+            await update.message.reply_text(
+                "⚠️ В выдаче Portals обнаружены разные валюты. "
+                "Нельзя корректно сравнить цены в одном расчёте.",
+                reply_markup=menu(),
+            )
+        else:
+            await update.message.reply_text(
+                portals_error_message(data["error"]), reply_markup=menu()
+            )
+        return
+
+    if not data.get("priced_count"):
+        await update.message.reply_text(
+            f"По коллекции «{collection}» не найдено активных объявлений с корректной ценой.",
+            reply_markup=menu(),
+        )
+        return
+
+    currency = data["currency"]
+    floor = data["floor"]
+    med = data["median"]
+    target = data["target_72h"]
+    spread = data["gross_spread"]
+    pct = data["gross_pct"]
+
+    if spread > 0:
+        signal = "🟢 Есть ценовой разрыв для дальнейшей проверки"
+    else:
+        signal = "🔴 Выраженного ценового разрыва не найдено"
+
+    lines = [
+        f"⚡ FAST FLIP — {collection}",
+        "",
+        f"📋 Активных объявлений: {data['listing_count']}",
+        f"💰 Минимальная цена: {number(floor)} {currency}",
+        f"📊 Медианная цена: {number(med)} {currency}",
+        f"🥊 Конкуренция: {data['competition']}",
+        "",
+        f"🎯 Ориентир выставления на 72 часа: {number(target)} {currency}",
+        f"📈 Валовой разрыв от минимальной цены: {number(spread)} {currency} ({number(pct, 2)}%)",
+        "",
+        signal,
+        "",
+        "Пять самых дешёвых объявлений:",
+    ]
+
+    for price, _, item in data["sample"]:
+        name = item.get("name") or collection
+        item_number = item.get("external_collection_number")
+        suffix = f" №{item_number}" if item_number is not None else ""
+        lines.append(f"• {name}{suffix} — {number(price)} {currency}")
+
+    lines.extend([
+        "",
+        "⚠️ Это анализ активных объявлений, а не завершённых продаж.",
+        "Ориентир 72 часа не гарантирует продажу за это время.",
+        "Расчёт без комиссий, газа и возможного изменения рынка.",
+    ])
+
+    await update.message.reply_text(
+        "\n".join(lines), reply_markup=menu(), disable_web_page_preview=True
+    )
+
 def portals_error_message(error):
     messages = {
         "portals_missing_key": (
@@ -556,6 +720,7 @@ def menu():
         [InlineKeyboardButton("🔎 Оценить подарок", callback_data="price")],
         [InlineKeyboardButton("🔢 Поиск подарка по номеру (Portals)", callback_data="portals_number")],
         [InlineKeyboardButton("📊 Сравнить цены", callback_data="compare")],
+        [InlineKeyboardButton("⚡ FAST FLIP + Liquidity Scanner", callback_data="fast_flip")],
         [InlineKeyboardButton("💎 Редкие подарки", callback_data="rare")],
         [InlineKeyboardButton("🏆 Топ подарков", callback_data="top")],
         [InlineKeyboardButton("📈 История цен", callback_data="history")],
@@ -594,6 +759,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alerts — мои уведомления\n"
         "/delalert ID — удалить уведомление\n"
         "/refresh — обновить цену\n"
+        "FAST FLIP — анализ активных объявлений Portals\n"
         "/help — помощь\n\n"
         "Поиск Portals по номеру:\n"
         "1234 — по всем коллекциям\n"
@@ -1119,6 +1285,14 @@ async def buttons(update, context):
             "📊 Напиши подарок для сравнения площадок.\n\n"
             "Пример: Plush Pepe / Frozen"
         ),
+        "fast_flip": (
+            "fast_flip",
+            "⚡ FAST FLIP + LIQUIDITY SCANNER\n\n"
+            "Напиши название коллекции для анализа активных объявлений Portals.\n"
+            "Пример: Plush Pepe\n\n"
+            "Будут рассчитаны минимум, медиана, число конкурирующих объявлений "
+            "и ориентир цены выставления на 72 часа."
+        ),
         "rare": (
             "rare",
             "💎 Напиши название коллекции.\n\n"
@@ -1199,7 +1373,10 @@ async def text_handler(update, context):
 
     await update.message.reply_text("⏳ Получаю данные...")
 
-    if mode == "rare":
+    if mode == "fast_flip":
+        await show_fast_flip(update, gift)
+
+    elif mode == "rare":
         await show_rare(update, gift)
 
     elif mode == "history":
@@ -1249,7 +1426,7 @@ def main():
         )
     )
 
-    logger.info("Ton Hunter 2.0 starting...")
+    logger.info("Ton Hunter FAST FLIP starting...")
 
     app.run_polling()
 
