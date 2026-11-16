@@ -27,10 +27,14 @@ from telegram.ext import (
 # CONFIG
 # =====================================
 
+PRODUCT_NAME = "GIFTS HUNTER"
+PRODUCT_VERSION = "1.0.1"
+
 TOKEN = os.getenv("BOT_TOKEN")
 API = "https://starprice.net/api/v1/gifts"
 PORTALS_API = "https://portal-market.com/partners"
 PORTALS_API_KEY = os.getenv("PORTALS_API_KEY")
+# Keep the legacy default filename to preserve existing history and alerts.
 DB_PATH = os.getenv("DB_PATH", "tonhunter.db")
 CHECK_INTERVAL = 300
 
@@ -38,7 +42,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("TonHunter")
+logger = logging.getLogger("GiftsHunter")
 
 
 # =====================================
@@ -178,7 +182,7 @@ def get_json(path=""):
     request = Request(
         API + path,
         headers={
-            "User-Agent": "TonHunter/2.0",
+            "User-Agent": "GiftsHunter/1.0.1",
             "Accept": "application/json"
         }
     )
@@ -231,7 +235,7 @@ def get_portals_json(params):
     request = Request(
         url,
         headers={
-            "User-Agent": "TonHunter/3.0",
+            "User-Agent": "GiftsHunter/1.0.1",
             "Accept": "application/json",
             "Authorization": f"partners {PORTALS_API_KEY}",
         },
@@ -381,11 +385,18 @@ async def portals_fast_flip_scan(collection):
 
     prices = sorted(x[0] for x in priced)
     floor = prices[0]
-    median_price = Decimal(str(median([float(x) for x in prices])))
-    # A conservative asking-price target; it is not a 72-hour sale forecast.
-    target_72h = median_price * Decimal("0.95")
-    gross_spread = target_72h - floor
-    gross_pct = (gross_spread / floor * Decimal("100")) if floor > 0 else Decimal("0")
+    middle = len(prices) // 2
+    if len(prices) % 2:
+        median_price = prices[middle]
+    else:
+        median_price = (prices[middle - 1] + prices[middle]) / Decimal("2")
+
+    # This is a listing-price spread only, not profit or a sale-time forecast.
+    listing_spread = median_price - floor
+    listing_spread_pct = (
+        listing_spread / floor * Decimal("100")
+        if floor > 0 else Decimal("0")
+    )
 
     count = len(priced)
     if count <= 5:
@@ -403,9 +414,8 @@ async def portals_fast_flip_scan(collection):
         "currency": next(iter(currencies)),
         "floor": floor,
         "median": median_price,
-        "target_72h": target_72h,
-        "gross_spread": gross_spread,
-        "gross_pct": gross_pct,
+        "listing_spread": listing_spread,
+        "listing_spread_pct": listing_spread_pct,
         "competition": competition,
         "sample": sample,
     }
@@ -440,9 +450,8 @@ async def show_fast_flip(update, collection):
     currency = data["currency"]
     floor = data["floor"]
     med = data["median"]
-    target = data["target_72h"]
-    spread = data["gross_spread"]
-    pct = data["gross_pct"]
+    spread = data["listing_spread"]
+    pct = data["listing_spread_pct"]
 
     if spread > 0:
         signal = "🟢 Есть ценовой разрыв для дальнейшей проверки"
@@ -457,8 +466,7 @@ async def show_fast_flip(update, collection):
         f"📊 Медианная цена: {number(med)} {currency}",
         f"🥊 Конкуренция: {data['competition']}",
         "",
-        f"🎯 Ориентир выставления на 72 часа: {number(target)} {currency}",
-        f"📈 Валовой разрыв от минимальной цены: {number(spread)} {currency} ({number(pct, 2)}%)",
+        f"📈 Разница между медианой и минимумом: {number(spread)} {currency} ({number(pct, 2)}%)",
         "",
         signal,
         "",
@@ -473,9 +481,9 @@ async def show_fast_flip(update, collection):
 
     lines.extend([
         "",
-        "⚠️ Это анализ активных объявлений, а не завершённых продаж.",
-        "Ориентир 72 часа не гарантирует продажу за это время.",
-        "Расчёт без комиссий, газа и возможного изменения рынка.",
+        "⚠️ Анализ основан на активных объявлениях, а не на завершённых продажах.",
+        "Разница между медианой и минимумом не является гарантированной прибылью.",
+        "Не учтены комиссии, газ, проскальзывание и изменение рынка.",
     ])
 
     await update.message.reply_text(
@@ -737,7 +745,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
-        "💎 Добро пожаловать в Ton Hunter 2.0!\n\n"
+        "💎 Добро пожаловать в Gifts Hunter!\n\n"
         "Анализатор NFT-подарков Telegram.\n\n"
         "🔎 Оценка стоимости\n"
         "🔢 Поиск подарка по номеру на Portals\n"
@@ -753,7 +761,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ℹ️ TON HUNTER 2.0\n\n"
+        "ℹ️ GIFTS HUNTER\n\n"
         "/start — главное меню\n"
         "/alert — создать уведомление\n"
         "/alerts — мои уведомления\n"
@@ -1012,7 +1020,7 @@ async def show_history(update, gift, model):
             )
 
     if local:
-        lines.append("\n📊 Наблюдения Ton Hunter:")
+        lines.append("\n📊 Наблюдения Gifts Hunter:")
 
         for row in reversed(local):
             date = row["recorded_at"][:16].replace("T", " ")
@@ -1291,7 +1299,7 @@ async def buttons(update, context):
             "Напиши название коллекции для анализа активных объявлений Portals.\n"
             "Пример: Plush Pepe\n\n"
             "Будут рассчитаны минимум, медиана, число конкурирующих объявлений "
-            "и ориентир цены выставления на 72 часа."
+            "и разницу между медианной и минимальной ценой."
         ),
         "rare": (
             "rare",
@@ -1305,7 +1313,7 @@ async def buttons(update, context):
         ),
         "help": (
             None,
-            "ℹ️ Ton Hunter 2.0\n\n"
+            "ℹ️ Gifts Hunter\n\n"
             "Анализатор NFT-подарков Telegram.\n"
             "Команды: /start /alert /alerts /delalert /refresh"
         )
@@ -1371,7 +1379,8 @@ async def text_handler(update, context):
 
     context.user_data["mode"] = None
 
-    await update.message.reply_text("⏳ Получаю данные...")
+    if mode != "fast_flip":
+        await update.message.reply_text("⏳ Получаю данные...")
 
     if mode == "fast_flip":
         await show_fast_flip(update, gift)
@@ -1426,7 +1435,7 @@ def main():
         )
     )
 
-    logger.info("Ton Hunter FAST FLIP starting...")
+    logger.info("Gifts Hunter starting...")
 
     app.run_polling()
 
