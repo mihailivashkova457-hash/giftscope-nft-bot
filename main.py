@@ -28,7 +28,7 @@ from telegram.ext import (
 # =====================================
 
 PRODUCT_NAME = "GIFTS HUNTER"
-PRODUCT_VERSION = "1.0.1"
+PRODUCT_VERSION = "1.0.3"
 
 TOKEN = os.getenv("BOT_TOKEN")
 API = "https://starprice.net/api/v1/gifts"
@@ -325,10 +325,10 @@ async def portals_search_number(number_value, collection=None):
 
 
 async def portals_fast_flip_scan(collection):
-    """Analyse current Portals listings for one collection.
-
-    This is a listing-based price/competition snapshot, not confirmed sales
-    data and not a prediction that an item will sell within 72 hours.
+    """
+    Снимок активных объявлений Portals.
+    TON и GRAM считаются одной единицей (1 TON = 1 GRAM).
+    Это оценка глубины предложения, а не подтверждённого оборота продаж.
     """
     if not PORTALS_API_KEY:
         return {"error": "portals_missing_key"}
@@ -346,6 +346,7 @@ async def portals_fast_flip_scan(collection):
             "status": "listed",
         }
         data = await asyncio.to_thread(get_portals_json, params)
+
         if isinstance(data, dict) and data.get("error"):
             return data
         if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
@@ -354,6 +355,7 @@ async def portals_fast_flip_scan(collection):
         page_items = data.get("results", [])
         listings.extend(x for x in page_items if isinstance(x, dict))
         offset += len(page_items)
+
         total = data.get("total_count", 0)
         if len(page_items) < 100 or (isinstance(total, int) and offset >= total):
             break
@@ -361,6 +363,8 @@ async def portals_fast_flip_scan(collection):
             await asyncio.sleep(1.05)
 
     priced = []
+    skipped_currency = 0
+
     for item in listings:
         raw_price = item.get("price")
         try:
@@ -369,34 +373,46 @@ async def portals_fast_flip_scan(collection):
                 continue
         except (InvalidOperation, ValueError, TypeError):
             continue
-        currency = str(item.get("currency") or item.get("price_currency") or "TON").upper()
-        priced.append((price, currency, item))
+
+        raw_currency = str(
+            item.get("currency") or item.get("price_currency") or "GRAM"
+        ).strip().upper()
+
+        # Portals отдаёт TON; в интерфейсе проекта это отображается как GRAM.
+        if raw_currency not in ("TON", "GRAM"):
+            skipped_currency += 1
+            continue
+
+        priced.append((price, "GRAM", item))
 
     if not priced:
-        return {"results": [], "listing_count": len(listings), "priced_count": 0}
-
-    currencies = {x[1] for x in priced}
-    if len(currencies) != 1:
         return {
-            "error": "portals_mixed_currency",
+            "results": [],
             "listing_count": len(listings),
-            "priced_count": len(priced),
+            "priced_count": 0,
+            "skipped_currency": skipped_currency,
         }
 
     prices = sorted(x[0] for x in priced)
     floor = prices[0]
     middle = len(prices) // 2
+
     if len(prices) % 2:
         median_price = prices[middle]
     else:
         median_price = (prices[middle - 1] + prices[middle]) / Decimal("2")
 
-    # This is a listing-price spread only, not profit or a sale-time forecast.
     listing_spread = median_price - floor
     listing_spread_pct = (
         listing_spread / floor * Decimal("100")
         if floor > 0 else Decimal("0")
     )
+
+    # Глубина около флора: сколько лотов выставлено не дороже флора + 5% / 10%.
+    near_5_limit = floor * Decimal("1.05")
+    near_10_limit = floor * Decimal("1.10")
+    near_5 = sum(1 for value in prices if value <= near_5_limit)
+    near_10 = sum(1 for value in prices if value <= near_10_limit)
 
     count = len(priced)
     if count <= 5:
@@ -406,17 +422,30 @@ async def portals_fast_flip_scan(collection):
     else:
         competition = "Высокая"
 
+    # Это только прокси ликвидности по глубине текущих объявлений.
+    if near_10 >= 10 and count >= 20:
+        liquidity = "Высокая глубина предложений"
+    elif near_10 >= 4:
+        liquidity = "Средняя глубина предложений"
+    else:
+        liquidity = "Низкая глубина предложений"
+
     sample = sorted(priced, key=lambda x: x[0])[:5]
+
     return {
         "collection": collection,
         "listing_count": len(listings),
         "priced_count": count,
-        "currency": next(iter(currencies)),
+        "skipped_currency": skipped_currency,
+        "currency": "GRAM",
         "floor": floor,
         "median": median_price,
         "listing_spread": listing_spread,
         "listing_spread_pct": listing_spread_pct,
         "competition": competition,
+        "near_5": near_5,
+        "near_10": near_10,
+        "liquidity": liquidity,
         "sample": sample,
     }
 
@@ -430,8 +459,7 @@ async def show_fast_flip(update, collection):
     if isinstance(data, dict) and data.get("error"):
         if data["error"] == "portals_mixed_currency":
             await update.message.reply_text(
-                "⚠️ В выдаче Portals обнаружены разные валюты. "
-                "Нельзя корректно сравнить цены в одном расчёте.",
+                "⚠️ Не удалось привести валюты объявлений к GRAM.",
                 reply_markup=menu(),
             )
         else:
@@ -442,31 +470,36 @@ async def show_fast_flip(update, collection):
 
     if not data.get("priced_count"):
         await update.message.reply_text(
-            f"По коллекции «{collection}» не найдено активных объявлений с корректной ценой.",
+            f"По коллекции «{collection}» не найдено активных объявлений "
+            "с ценой в GRAM.",
             reply_markup=menu(),
         )
         return
 
-    currency = data["currency"]
     floor = data["floor"]
     med = data["median"]
     spread = data["listing_spread"]
     pct = data["listing_spread_pct"]
 
-    if spread > 0:
-        signal = "🟢 Есть ценовой разрыв для дальнейшей проверки"
+    if pct >= Decimal("5"):
+        signal = "🟢 Разрыв больше 5% — стоит проверить самый дешёвый лот"
+    elif pct > 0:
+        signal = "🟡 Небольшой разрыв — проверь комиссии и спрос"
     else:
-        signal = "🔴 Выраженного ценового разрыва не найдено"
+        signal = "🔴 Выраженного ценового разрыва нет"
 
     lines = [
-        f"⚡ FAST FLIP — {collection}",
+        f"⚡ FAST FLIP + LIQUIDITY — {collection}",
         "",
-        f"📋 Активных объявлений: {data['listing_count']}",
-        f"💰 Минимальная цена: {number(floor)} {currency}",
-        f"📊 Медианная цена: {number(med)} {currency}",
+        f"📋 Активных объявлений получено: {data['listing_count']}",
+        f"💰 Минимальная цена: {number(floor)} GRAM",
+        f"📊 Медианная цена: {number(med)} GRAM",
+        f"📈 Разница медиана/минимум: {number(spread)} GRAM ({number(pct, 2)}%)",
+        "",
         f"🥊 Конкуренция: {data['competition']}",
-        "",
-        f"📈 Разница между медианой и минимумом: {number(spread)} {currency} ({number(pct, 2)}%)",
+        f"💧 Ликвидность по глубине объявлений: {data['liquidity']}",
+        f"📦 Лотов в пределах +5% от флора: {data['near_5']}",
+        f"📦 Лотов в пределах +10% от флора: {data['near_10']}",
         "",
         signal,
         "",
@@ -477,13 +510,21 @@ async def show_fast_flip(update, collection):
         name = item.get("name") or collection
         item_number = item.get("external_collection_number")
         suffix = f" №{item_number}" if item_number is not None else ""
-        lines.append(f"• {name}{suffix} — {number(price)} {currency}")
+        lines.append(f"• {name}{suffix} — {number(price)} GRAM")
+
+    if data.get("skipped_currency"):
+        lines.extend([
+            "",
+            f"ℹ️ Пропущено объявлений в другой валюте: {data['skipped_currency']}",
+        ])
 
     lines.extend([
         "",
-        "⚠️ Анализ основан на активных объявлениях, а не на завершённых продажах.",
-        "Разница между медианой и минимумом не является гарантированной прибылью.",
-        "Не учтены комиссии, газ, проскальзывание и изменение рынка.",
+        "⚠️ Важно: это анализ активных объявлений Portals, а не завершённых продаж.",
+        "Глубина объявлений — лишь косвенный показатель ликвидности.",
+        "Для настоящей ликвидности нужны объём и скорость завершённых продаж.",
+        "Разница между медианой и флором не является гарантированной прибылью.",
+        "Перед покупкой проверь сам лот, комиссии и возможность перепродажи.",
     ])
 
     await update.message.reply_text(
@@ -631,11 +672,23 @@ def number(value, decimals=6):
         return str(value)
 
 
+def display_currency(currency):
+    """Единый формат проекта: TON и GRAM показываем как GRAM."""
+    value = str(currency or "").strip().upper()
+    if value in ("", "TON", "GRAM"):
+        return "GRAM"
+    return value
+
+
 def money(value, currency=""):
     if value is None:
-        return "нет данных"
+        return "нет данных в GRAM"
 
-    return f"{number(value)} {currency}".strip()
+    shown_currency = display_currency(currency)
+    if shown_currency != "GRAM":
+        return "нет курса пересчёта в GRAM"
+
+    return f"{number(value)} GRAM"
 
 
 def rub_text(value):
@@ -654,7 +707,7 @@ def floor_text(floor):
         floor.get("currency", "")
     )
 
-    return result + rub_text(floor.get("rub"))
+    return result
 
 
 def offers_text(offers):
@@ -682,8 +735,6 @@ def offers_text(offers):
             offer.get("price"),
             offer.get("currency", "")
         )
-
-        price += rub_text(offer.get("rub"))
 
         line = f"• {market}: {price}"
 
@@ -767,14 +818,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alerts — мои уведомления\n"
         "/delalert ID — удалить уведомление\n"
         "/refresh — обновить цену\n"
-        "FAST FLIP — анализ активных объявлений Portals\n"
+        "FAST FLIP — анализ объявлений и глубины рынка Portals\n"
         "/help — помощь\n\n"
         "Поиск Portals по номеру:\n"
         "1234 — по всем коллекциям\n"
         "Plush Pepe / 1234 — в конкретной коллекции\n\n"
         "Для уведомления отправь:\n"
         "Plush Pepe / Frozen / 50000\n\n"
-        "Последнее число — целевая цена в рублях.",
+        "Цены TON/GRAM показываются только в GRAM (1:1).\n"
+        "Другие валюты без надёжного курса не пересчитываются.\n"
+        "Уведомления пока задаются в рублях.",
         reply_markup=menu()
     )
 
@@ -1027,7 +1080,6 @@ async def show_history(update, gift, model):
 
             price = money(row["price"], row["currency"])
 
-            price += rub_text(row["rub"])
 
             lines.append(f"\n{date}: {price}")
 
@@ -1054,7 +1106,7 @@ async def create_alert_from_text(update, text):
         await update.message.reply_text(
             "Формат:\n"
             "Plush Pepe / Frozen / 50000\n\n"
-            "Последнее число — цена в рублях."
+            "Последнее число — целевая цена в рублях (уведомления пока работают в ₽)."
         )
         return
 
