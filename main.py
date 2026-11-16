@@ -1,4 +1,4 @@
-
+from contextlib import contextmanager
 import os
 import json
 import logging
@@ -41,10 +41,19 @@ logger = logging.getLogger("TonHunter")
 # DATABASE
 # =====================================
 
+
+
+
+@contextmanager
 def database():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
 
 
 def init_db():
