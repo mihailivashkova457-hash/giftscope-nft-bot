@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.request import Request, urlopen
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.error import HTTPError, URLError
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,6 +27,8 @@ from telegram.ext import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 API = "https://starprice.net/api/v1/gifts"
+PORTALS_API = "https://portal-market.com/partners"
+PORTALS_API_KEY = os.getenv("PORTALS_API_KEY")
 DB_PATH = os.getenv("DB_PATH", "tonhunter.db")
 CHECK_INTERVAL = 300
 
@@ -214,6 +216,190 @@ def api_path(gift, model=None):
     return path
 
 
+
+# =====================================
+# PORTALS SEARCH BY GIFT NUMBER
+# =====================================
+
+def get_portals_json(params):
+    if not PORTALS_API_KEY:
+        return {"error": "portals_missing_key"}
+
+    url = PORTALS_API + "/nfts/search?" + urlencode(params)
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "TonHunter/3.0",
+            "Accept": "application/json",
+            "Authorization": f"partners {PORTALS_API_KEY}",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=25) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            payload = {}
+
+        code = payload.get("code", "")
+        if exc.code == 401:
+            return {"error": "portals_auth"}
+        if exc.code == 403:
+            return {"error": "portals_access", "details": payload.get("message", code)}
+        if exc.code == 429:
+            return {"error": "portals_rate_limit"}
+        logger.warning("Portals HTTP %s: %s", exc.code, payload)
+        return {"error": "portals_api"}
+    except (URLError, TimeoutError, ValueError, OSError):
+        logger.exception("Portals connection error")
+        return {"error": "portals_connection"}
+
+
+async def portals_search_number(number_value, collection=None):
+    """Search listed Portals NFTs by exact collection number.
+
+    Portals treats external_collection_number as a prefix filter, so exact
+    matching is applied locally after fetching each page.
+    """
+    if not PORTALS_API_KEY:
+        return {"error": "portals_missing_key"}
+
+    params = {
+        "external_collection_number": str(number_value),
+        "limit": 100,
+        "offset": 0,
+        "sort_by": "price asc",
+        "status": "listed",
+    }
+    if collection:
+        params["name_filter"] = collection
+
+    found = []
+    offset = 0
+    max_pages = 5
+
+    for page in range(max_pages):
+        page_params = dict(params, offset=offset)
+        data = await asyncio.to_thread(get_portals_json, page_params)
+
+        if isinstance(data, dict) and data.get("error"):
+            return data
+        if not isinstance(data, dict):
+            return {"error": "portals_bad_response"}
+
+        results = data.get("results", [])
+        if not isinstance(results, list):
+            return {"error": "portals_bad_response"}
+
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_number = int(item.get("external_collection_number"))
+            except (TypeError, ValueError):
+                continue
+
+            # Avoid returning prefix collisions, e.g. 123 for a search of 12.
+            if item_number == int(number_value):
+                found.append(item)
+
+        offset += len(results)
+        total = data.get("total_count", 0)
+        if len(results) < 100 or offset >= total or len(found) >= 20:
+            break
+
+        # The free Portals plan allows one request per second.
+        await asyncio.sleep(1.05)
+
+    return {"results": found[:20], "total_count": len(found)}
+
+
+def portals_error_message(error):
+    messages = {
+        "portals_missing_key": (
+            "⚠️ Не найден PORTALS_API_KEY. Добавь ключ в Variables проекта Railway."
+        ),
+        "portals_auth": (
+            "❌ Portals отклонил ключ. Проверь PORTALS_API_KEY в Railway."
+        ),
+        "portals_access": (
+            "⛔ Portals не разрешил запрос. Проверь доступ и тариф Partner API."
+        ),
+        "portals_rate_limit": (
+            "⏳ Portals ограничил частоту запросов. Попробуй немного позже."
+        ),
+        "portals_connection": "⚠️ Не удалось подключиться к Portals.",
+        "portals_api": "⚠️ Ошибка Portals API.",
+        "portals_bad_response": "⚠️ Portals вернул ответ неожиданного формата.",
+    }
+    return messages.get(error, "⚠️ Не удалось выполнить поиск в Portals.")
+
+
+async def show_portals_number_search(update, number_value, collection=None):
+    if not number_value.isdigit():
+        await update.message.reply_text(
+            "Номер должен состоять только из цифр. Примеры:\n"
+            "1234\n"
+            "Plush Pepe / 1234"
+        )
+        return
+
+    await update.message.reply_text("🔎 Ищу подарок на Portals...")
+    data = await portals_search_number(number_value, collection)
+
+    if isinstance(data, dict) and data.get("error"):
+        await update.message.reply_text(portals_error_message(data["error"]))
+        return
+
+    results = data.get("results", []) if isinstance(data, dict) else []
+    if not results:
+        scope = f" в коллекции «{collection}»" if collection else " во всех коллекциях"
+        await update.message.reply_text(
+            f"Подарок №{number_value}{scope} не найден среди выставленных на Portals."
+        )
+        return
+
+    heading = (
+        f"🎁 РЕЗУЛЬТАТЫ PORTALS\n"
+        f"Номер: {number_value}\n"
+        f"Коллекция: {collection or 'все коллекции'}\n"
+        f"Найдено: {len(results)}"
+    )
+    lines = [heading]
+
+    for item in results[:20]:
+        name = item.get("name", "Без названия")
+        status = item.get("status", "неизвестно")
+        price = item.get("price")
+        floor_price = item.get("floor_price")
+
+        lines.append(
+            f"\n• {name} №{item.get('external_collection_number', number_value)}"
+            f"\n  Цена: {money(price, 'GRAM') if price is not None else 'не выставлен'}"
+            f"\n  Флор коллекции: {money(floor_price, 'GRAM')}"
+            f"\n  Статус: {status}"
+        )
+
+        attributes = item.get("attributes", [])
+        if isinstance(attributes, list):
+            for attribute in attributes:
+                if not isinstance(attribute, dict):
+                    continue
+                attr_name = attribute.get("type") or attribute.get("name") or "Атрибут"
+                attr_value = attribute.get("value") or attribute.get("name_value")
+                if attr_value:
+                    lines.append(f"  {attr_name}: {attr_value}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=menu(),
+        disable_web_page_preview=True,
+    )
+
+
 # =====================================
 # FORMATTING
 # =====================================
@@ -332,6 +518,7 @@ def error_message(error):
 def menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔎 Оценить подарок", callback_data="price")],
+        [InlineKeyboardButton("🔢 Поиск подарка по номеру (Portals)", callback_data="portals_number")],
         [InlineKeyboardButton("📊 Сравнить цены", callback_data="compare")],
         [InlineKeyboardButton("💎 Редкие подарки", callback_data="rare")],
         [InlineKeyboardButton("🏆 Топ подарков", callback_data="top")],
@@ -352,6 +539,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💎 Добро пожаловать в Ton Hunter 2.0!\n\n"
         "Анализатор NFT-подарков Telegram.\n\n"
         "🔎 Оценка стоимости\n"
+        "🔢 Поиск подарка по номеру на Portals\n"
         "📊 Сравнение площадок\n"
         "💎 Редкость моделей\n"
         "🏆 Топ коллекций\n"
@@ -371,6 +559,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/delalert ID — удалить уведомление\n"
         "/refresh — обновить цену\n"
         "/help — помощь\n\n"
+        "Поиск Portals по номеру:\n"
+        "1234 — по всем коллекциям\n"
+        "Plush Pepe / 1234 — в конкретной коллекции\n\n"
         "Для уведомления отправь:\n"
         "Plush Pepe / Frozen / 50000\n\n"
         "Последнее число — целевая цена в рублях.",
@@ -876,6 +1067,12 @@ async def buttons(update, context):
         return
 
     actions = {
+        "portals_number": (
+            "portals_number",
+            "🔢 Отправь номер подарка для поиска по всем коллекциям Portals.\n\n"
+            "Или укажи коллекцию и номер:\n"
+            "Plush Pepe / 1234"
+        ),
         "price": (
             "price",
             "🔎 Напиши название подарка или модели.\n\n"
@@ -935,6 +1132,22 @@ async def text_handler(update, context):
     if mode == "alert":
         context.user_data["mode"] = None
         await create_alert_from_text(update, text)
+        return
+
+    if mode == "portals_number":
+        context.user_data["mode"] = None
+        parts = text.split("/", 1)
+        if len(parts) == 2:
+            collection = parts[0].strip()
+            number_value = parts[1].strip()
+            if not collection:
+                await update.message.reply_text("Укажи название коллекции.")
+                return
+        else:
+            collection = None
+            number_value = text.strip()
+
+        await show_portals_number_search(update, number_value, collection)
         return
 
     parts = text.split("/", 1)
