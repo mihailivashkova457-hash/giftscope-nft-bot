@@ -231,36 +231,60 @@ def api_path(gift, model=None):
 # PORTALS SEARCH BY GIFT NUMBER
 # =====================================
 
+
 def get_portals_endpoint(endpoint, params=None):
     """GET helper for authenticated Portals Partner API endpoints."""
     if not PORTALS_API_KEY:
         return {"error": "portals_missing_key"}
+
     query = "?" + urlencode(params or {}) if params else ""
-    request = Request(PORTALS_API + endpoint + query, headers={
-        "User-Agent": f"GiftsHunter/{PRODUCT_VERSION}",
-        "Accept": "application/json",
-        "Authorization": f"partners {PORTALS_API_KEY}",
-    })
+    request = Request(
+        PORTALS_API + endpoint + query,
+        headers={
+            "User-Agent": f"GiftsHunter/{PRODUCT_VERSION}",
+            "Accept": "application/json",
+            "Authorization": f"partners {PORTALS_API_KEY}",
+        },
+    )
+
     try:
         with urlopen(request, timeout=25) as response:
-    body = response.read().decode("utf-8")
+            body = response.read().decode("utf-8")
+            logger.info("PORTALS STATUS: %s", response.status)
+            logger.info("PORTALS RESPONSE: %s", body[:1000])
+            return json.loads(body)
 
-    logger.info("PORTALS STATUS: %s", response.status)
-    logger.info("PORTALS RESPONSE: %s", body[:2000])
-
-    return json.loads(body)
     except HTTPError as exc:
-        try: payload = json.loads(exc.read().decode("utf-8"))
-        except Exception: payload = {}
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            payload = {}
+
         code = payload.get("code", "")
-        if exc.code == 401: return {"error": "portals_auth"}
-        if exc.code == 403: return {"error": "portals_access", "details": payload.get("message", code)}
-        if exc.code == 429: return {"error": "portals_rate_limit"}
-        logger.warning("Portals HTTP %s at %s: %s", exc.code, endpoint, payload)
-        return {"error": "portals_api", "details": payload.get("message", code)}
+
+        if exc.code == 401:
+            return {"error": "portals_auth"}
+        if exc.code == 403:
+            return {
+                "error": "portals_access",
+                "details": payload.get("message", code),
+            }
+        if exc.code == 429:
+            return {"error": "portals_rate_limit"}
+
+        logger.warning(
+            "Portals HTTP %s at %s: %s",
+            exc.code, endpoint, payload
+        )
+        return {
+            "error": "portals_api",
+            "details": payload.get("message", code),
+        }
+
     except (URLError, TimeoutError, ValueError, OSError):
         logger.exception("Portals connection error at %s", endpoint)
         return {"error": "portals_connection"}
+
 
 
 def get_portals_json(params):
