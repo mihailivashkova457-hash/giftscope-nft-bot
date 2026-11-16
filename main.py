@@ -243,14 +243,19 @@ def get_portals_endpoint(endpoint, params=None):
         headers={
             "User-Agent": f"GiftsHunter/{PRODUCT_VERSION}",
             "Accept": "application/json",
-            "Authorization": f"partners {PORTALS_API_KEY}",
+            "Authorization": f"partners {PORTALS_API_KEY.strip()}",
         },
     )
 
     try:
         with urlopen(request, timeout=25) as response:
             body = response.read().decode("utf-8")
-            payload = json.loads(body)
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                logger.error("Portals returned invalid JSON: endpoint=%s status=%s body=%r",
+                             endpoint, response.status, body[:500])
+                return {"error": "portals_bad_response"}
             logger.info("PORTALS HTTP %s %s", response.status, endpoint)
             if isinstance(payload, dict):
                 logger.info("PORTALS RESPONSE %s keys=%s", endpoint, sorted(payload.keys()))
@@ -259,36 +264,44 @@ def get_portals_endpoint(endpoint, params=None):
             return payload
 
     except HTTPError as exc:
+        raw_body = exc.read().decode("utf-8", errors="replace")
         try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except Exception:
+            payload = json.loads(raw_body) if raw_body else {}
+        except json.JSONDecodeError:
             payload = {}
 
-        code = payload.get("code", "")
+        if not isinstance(payload, dict):
+            payload = {"response": str(payload)[:300]}
+
+        api_code = str(payload.get("code") or "")
+        api_message = str(payload.get("message") or payload.get("detail") or raw_body or "")
+        details = f"HTTP {exc.code}"
+        if api_code:
+            details += f" / {api_code}"
+        if api_message:
+            details += f": {api_message[:300]}"
+
+        logger.warning("Portals HTTP error endpoint=%s %s", endpoint, details)
 
         if exc.code == 401:
-            return {"error": "portals_auth"}
+            return {"error": "portals_auth", "details": details}
         if exc.code == 403:
-            return {
-                "error": "portals_access",
-                "details": payload.get("message", code),
-            }
+            return {"error": "portals_access", "details": details}
         if exc.code == 429:
-            return {"error": "portals_rate_limit"}
+            return {"error": "portals_rate_limit", "details": details}
+        if exc.code == 422:
+            return {"error": "portals_bad_request", "details": details}
+        if exc.code == 503 and api_code == "MARKET_FEED_UNAVAILABLE":
+            return {"error": "portals_feed_unavailable", "details": details}
+        if exc.code == 503:
+            return {"error": "portals_unavailable", "details": details}
+        if exc.code >= 500:
+            return {"error": "portals_server_error", "details": details}
+        return {"error": "portals_api", "details": details}
 
-        logger.warning(
-            "Portals HTTP %s at %s: %s",
-            exc.code, endpoint, payload
-        )
-        return {
-            "error": "portals_api",
-            "details": payload.get("message", code),
-        }
-
-    except (URLError, TimeoutError, ValueError, OSError):
+    except (URLError, TimeoutError, OSError):
         logger.exception("Portals connection error at %s", endpoint)
         return {"error": "portals_connection"}
-
 
 
 def get_portals_json(params):
@@ -606,7 +619,7 @@ async def show_fast_flip(update, budget):
     )
     data = await portals_fast_flip_scan(budget)
     if data.get("error"):
-        await update.message.reply_text(portals_error_message(data["error"]), reply_markup=menu())
+        await update.message.reply_text(portals_error_message(data["error"], data.get("details")), reply_markup=menu())
         return
     lines = ["⚡ FAST FLIP — ГЛОБАЛЬНЫЙ СКАНЕР", f"💳 Бюджет: до {number(budget)} GRAM",
         f"🔎 Получено объявлений: {data['listing_count']}",
@@ -642,7 +655,7 @@ async def show_fast_flip(update, budget):
     await update.message.reply_text("\n".join(lines), reply_markup=menu(), disable_web_page_preview=True)
 
 
-def portals_error_message(error):
+def portals_error_message(error, details=None):
     messages = {
         "portals_missing_key": (
             "⚠️ Не найден PORTALS_API_KEY. Добавь ключ в Variables проекта Railway."
@@ -658,9 +671,16 @@ def portals_error_message(error):
         ),
         "portals_connection": "⚠️ Не удалось подключиться к Portals.",
         "portals_api": "⚠️ Ошибка Portals API.",
+        "portals_bad_request": "⚠️ Portals отклонил параметры запроса (422). Проверь логи Railway.",
+        "portals_feed_unavailable": "⏳ Лента покупок Portals временно недоступна (503). Попробуй позже.",
+        "portals_unavailable": "⏳ Portals временно недоступен (503). Попробуй позже.",
+        "portals_server_error": "⚠️ Внутренняя ошибка серверов Portals (5xx). Попробуй позже.",
         "portals_bad_response": "⚠️ Portals вернул ответ неожиданного формата.",
     }
-    return messages.get(error, "⚠️ Не удалось выполнить поиск в Portals.")
+    message = messages.get(error, "⚠️ Не удалось выполнить поиск в Portals.")
+    if details:
+        message += f"\\n\\nДиагностика: {str(details)[:350]}"
+    return message
 
 
 async def show_portals_number_search(update, number_value, collection=None):
@@ -676,7 +696,7 @@ async def show_portals_number_search(update, number_value, collection=None):
     data = await portals_search_number(number_value, collection)
 
     if isinstance(data, dict) and data.get("error"):
-        await update.message.reply_text(portals_error_message(data["error"]))
+        await update.message.reply_text(portals_error_message(data["error"], data.get("details")))
         return
 
     results = data.get("results", []) if isinstance(data, dict) else []
