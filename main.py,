@@ -191,15 +191,57 @@ def process_payment_request(request_id, approve, owner_id):
 def plans_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("7 дней — 34 GRAM", callback_data="buy_week")],
-        [InlineKeyboardButton("1 месяц — 94 GRAM", callback_data="buy_month")],
-        [InlineKeyboardButton("1 год — 794 GRAM", callback_data="buy_year")],
-        [InlineKeyboardButton("💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
+        [InlineKeyboardButton("30 дней — 94 GRAM", callback_data="buy_month")],
+        [InlineKeyboardButton("365 дней — 794 GRAM", callback_data="buy_year")],
+        [InlineKeyboardButton("🛡 Как проходит покупка", callback_data="how_buy")],
+        [InlineKeyboardButton("💬 Поддержка", callback_data="support")],
     ])
+
+
+def purchase_info_text():
+    return (
+        "🛡 ПРОЗРАЧНАЯ ПОКУПКА\n\n"
+        "1. Выбери тариф.\n"
+        "2. Напиши в поддержку и сообщи номер заявки.\n"
+        "3. Поддержка предоставит инструкции и актуальные реквизиты.\n"
+        "4. Не отправляй GRAM, пока не получил инструкции.\n"
+        "5. После оплаты отправь подтверждение поддержке.\n"
+        "6. Владелец вручную проверит поступление и активирует доступ. Бот пришлёт уведомление.\n\n"
+        "Важно: создание заявки не означает, что оплата произведена. "
+        "Никому не сообщай пароль, коды входа или seed-фразу кошелька.\n\n"
+        f"Поддержка: @{SUPPORT_USERNAME}"
+    )
+
 
 
 def access_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Выбрать тариф", callback_data="plans")],
-                                 [InlineKeyboardButton("💬 Написать в поддержку", url=f"https://t.me/{SUPPORT_USERNAME}")]])
+                                 [InlineKeyboardButton("💬 Поддержка", callback_data="support")]])
+
+
+def support_entry_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 НАЧАТЬ", callback_data="support_start")],
+        [InlineKeyboardButton("↩️ Главное меню", callback_data="support_home")],
+    ])
+
+
+def support_topics_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 Проблема с покупкой", callback_data="support_topic_purchase")],
+        [InlineKeyboardButton("💳 Вопрос по оплате", callback_data="support_topic_payment")],
+        [InlineKeyboardButton("📦 Статус заявки", callback_data="support_topic_status")],
+        [InlineKeyboardButton("🔐 Безопасность", callback_data="support_topic_security")],
+        [InlineKeyboardButton("❓ Другой вопрос", callback_data="support_topic_other")],
+        [InlineKeyboardButton("↩️ Главное меню", callback_data="support_home")],
+    ])
+
+
+def support_contact_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Написать специалисту", url=f"https://t.me/{SUPPORT_USERNAME}")],
+        [InlineKeyboardButton("↩️ Главное меню", callback_data="support_home")],
+    ])
 
 
 def save_history(gift, model, floor):
@@ -1029,7 +1071,7 @@ def menu():
             InlineKeyboardButton("🔔 Уведомления", callback_data="alerts"),
         ],
         [InlineKeyboardButton("💎 Тарифы", callback_data="plans"),
-         InlineKeyboardButton("🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
+         InlineKeyboardButton("🆘 Поддержка", callback_data="support")],
         [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
     ])
 
@@ -1591,7 +1633,73 @@ async def buttons(update, context):
             return
 
     if action == "plans":
-        await query.message.reply_text("💎 ТАРИФЫ GIFTS HUNTER\n\n7 дней — 34 GRAM\n1 месяц — 94 GRAM\n1 год — 794 GRAM\n\nОплата вручную через поддержку. После согласования ты отправляешь оплату, а владелец подтверждает её в боте.", reply_markup=plans_keyboard())
+        await query.message.reply_text(
+            "💎 GIFTS HUNTER PREMIUM\n\n"
+            "Полный доступ к инструментам анализа Telegram-подарков.\n\n"
+            "📦 ТАРИФЫ\n"
+            "• 7 дней — 34 GRAM\n"
+            "• 30 дней — 94 GRAM\n"
+            "• 365 дней — 794 GRAM\n\n"
+            "🛡 Оплата проходит вручную через поддержку. Сначала ты получаешь инструкции, "
+            "а доступ включается только после проверки поступления владельцем.\n\n"
+            "Не отправляй средства, пока не согласуешь детали с поддержкой.",
+            reply_markup=plans_keyboard()
+        )
+        return
+
+    if action == "how_buy":
+        await query.message.reply_text(purchase_info_text(), reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 Вернуться к тарифам", callback_data="plans")],
+            [InlineKeyboardButton("💬 Поддержка", callback_data="support")],
+        ]))
+        return
+
+    if action == "support":
+        context.user_data["mode"] = None
+        await query.message.reply_text(
+            "🎧 СЛУЖБА ПОДДЕРЖКИ GIFTS HUNTER\n\n"
+            "Здесь можно получить помощь по покупке, оплате и работе сервиса.\n\n"
+            "Нажмите «НАЧАТЬ», чтобы перейти к выбору темы обращения.",
+            reply_markup=support_entry_keyboard()
+        )
+        return
+
+    if action == "support_start":
+        context.user_data["mode"] = None
+        await query.message.reply_text(
+            f"👋 Здравствуйте, {query.from_user.first_name or 'друг'}!\n\n"
+            "Вы обратились в службу поддержки GIFTS HUNTER.\n"
+            "Выберите тему, чтобы мы подсказали дальнейшие действия.\n\n"
+            "🔒 В целях безопасности никогда не отправляйте пароли, коды входа или seed-фразу кошелька.",
+            reply_markup=support_topics_keyboard()
+        )
+        return
+
+    if action == "support_home":
+        context.user_data["mode"] = None
+        active, _expiry, _trial = access_status(query.from_user.id)
+        await query.message.reply_text(
+            "💎 GIFTS HUNTER\nВыберите инструмент в меню ниже:",
+            reply_markup=menu() if active else access_keyboard()
+        )
+        return
+
+    support_topics = {
+        "support_topic_purchase": "🛒 Проблема с покупкой",
+        "support_topic_payment": "💳 Вопрос по оплате",
+        "support_topic_status": "📦 Статус заявки",
+        "support_topic_security": "🔐 Безопасность аккаунта",
+        "support_topic_other": "❓ Другой вопрос",
+    }
+    if action in support_topics:
+        context.user_data["support_topic"] = support_topics[action]
+        context.user_data["mode"] = None
+        await query.message.reply_text(
+            f"Тема обращения: {support_topics[action]}\n\n"
+            "Чтобы получить помощь, напишите специалисту. Укажите номер заявки, если вопрос связан с покупкой.\n\n"
+            "⚠️ Не отправляйте GRAM до получения официальных инструкций и никогда не передавайте секретные данные кошелька.",
+            reply_markup=support_contact_keyboard()
+        )
         return
 
     if action.startswith("buy_"):
@@ -1601,7 +1709,18 @@ async def buttons(update, context):
         user = query.from_user
         req_id = create_payment_request(user, plan_key)
         plan_name, price, _days = PLANS[plan_key]
-        await query.message.reply_text(f"✅ Заявка №{req_id} создана.\nТариф: {plan_name}\nСтоимость: {price} GRAM\n\nНапиши в поддержку @{SUPPORT_USERNAME}, чтобы получить инструкции по ручной оплате. После оплаты владелец проверит поступление и активирует доступ.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Открыть поддержку", url=f"https://t.me/{SUPPORT_USERNAME}")]]))
+        await query.message.reply_text(
+            f"🧾 Заявка №{req_id} создана\n"
+            f"Тариф: {plan_name}\nСтоимость: {price} GRAM\n\n"
+            "Следующий шаг — напиши в поддержку и укажи номер заявки. "
+            "Поддержка предоставит инструкции и актуальные реквизиты.\n\n"
+            "⚠️ Пока не получил инструкции, ничего не отправляй. Заявка не означает, что оплата уже совершена. "
+            "После перевода владелец вручную проверит поступление и активирует доступ.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 Поддержка", callback_data="support")],
+                [InlineKeyboardButton("🛡 Как проходит покупка", callback_data="how_buy")],
+            ])
+        )
         try:
             await context.bot.send_message(OWNER_ID, f"🧾 Новая заявка на оплату №{req_id}\nПользователь: {user.full_name} (@{user.username or 'без username'})\nID: {user.id}\nТариф: {plan_name} — {price} GRAM", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить", callback_data=f"pay_approve_{req_id}"), InlineKeyboardButton("❌ Отклонить", callback_data=f"pay_reject_{req_id}")]]))
         except Exception:
