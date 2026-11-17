@@ -908,16 +908,25 @@ def error_message(error):
 # =====================================
 
 def menu():
+    """Компактное главное меню: короткие кнопки в две колонки."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 Оценить подарок", callback_data="price")],
-        [InlineKeyboardButton("🔢 Поиск подарка по номеру (Portals)", callback_data="portals_number")],
-        [InlineKeyboardButton("📊 Сравнить цены", callback_data="compare")],
-        [InlineKeyboardButton("⚡ FAST FLIP + Liquidity Scanner", callback_data="fast_flip")],
-        [InlineKeyboardButton("💎 Редкие подарки", callback_data="rare")],
-        [InlineKeyboardButton("🏆 Топ подарков", callback_data="top")],
-        [InlineKeyboardButton("📈 История цен", callback_data="history")],
-        [InlineKeyboardButton("🔔 Уведомления", callback_data="alerts")],
-        [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")]
+        [
+            InlineKeyboardButton("⚡ FAST FLIP", callback_data="fast_flip"),
+            InlineKeyboardButton("🔎 Оценка", callback_data="price"),
+        ],
+        [
+            InlineKeyboardButton("🔢 Поиск №", callback_data="portals_number"),
+            InlineKeyboardButton("📊 Рынок", callback_data="compare"),
+        ],
+        [
+            InlineKeyboardButton("💎 Редкость", callback_data="rare"),
+            InlineKeyboardButton("🏆 Топ", callback_data="top"),
+        ],
+        [
+            InlineKeyboardButton("📈 История", callback_data="history"),
+            InlineKeyboardButton("🔔 Уведомления", callback_data="alerts"),
+        ],
+        [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
     ])
 
 
@@ -929,16 +938,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
-        "💎 Добро пожаловать в Gifts Hunter!\n\n"
-        "Анализатор NFT-подарков Telegram.\n\n"
-        "🔎 Оценка стоимости\n"
-        "🔢 Поиск подарка по номеру на Portals\n"
-        "📊 Сравнение площадок\n"
-        "💎 Редкость моделей\n"
-        "🏆 Топ коллекций\n"
-        "📈 История цен\n"
-        "🔔 Уведомления о снижении цены\n\n"
-        "Выбери нужный раздел:",
+        "💎 GIFTS HUNTER\n"
+        "Анализ рынка Telegram-подарков\n\n"
+        "Выбери инструмент в меню ниже:",
         reply_markup=menu()
     )
 
