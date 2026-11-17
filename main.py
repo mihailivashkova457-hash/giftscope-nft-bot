@@ -28,7 +28,11 @@ from telegram.ext import (
 # =====================================
 
 PRODUCT_NAME = "GIFTS HUNTER"
-PRODUCT_VERSION = "1.1.0"
+PRODUCT_VERSION = "1.2.0"
+OWNER_ID = int(os.getenv("OWNER_ID", "1443915106"))
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "GiftsHunterCare").lstrip("@")
+TRIAL_HOURS = 24
+PLANS = {"week": ("7 дней", 34, 7), "month": ("1 месяц", 94, 30), "year": ("1 год", 794, 365)}
 
 TOKEN = os.getenv("BOT_TOKEN")
 API = "https://starprice.net/api/v1/gifts"
@@ -86,6 +90,27 @@ def init_db():
         """)
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER PRIMARY KEY,
+                trial_started_at TEXT,
+                expires_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT DEFAULT '',
+                plan_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                processed_at TEXT,
+                processed_by INTEGER
+            )
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
@@ -98,6 +123,83 @@ def init_db():
         """)
 
         conn.commit()
+
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def ensure_trial(user_id):
+    now = utc_now()
+    with database() as conn:
+        row = conn.execute("SELECT * FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
+        if row is None:
+            conn.execute("INSERT INTO subscriptions (user_id, trial_started_at, expires_at, updated_at) VALUES (?, ?, ?, ?)",
+                         (user_id, now.isoformat(), (now.replace(microsecond=0) + __import__('datetime').timedelta(hours=TRIAL_HOURS)).isoformat(), now.isoformat()))
+            return
+        if not row["trial_started_at"] and not row["expires_at"]:
+            conn.execute("UPDATE subscriptions SET trial_started_at=?, expires_at=?, updated_at=? WHERE user_id=?",
+                         (now.isoformat(), (now + __import__('datetime').timedelta(hours=TRIAL_HOURS)).isoformat(), now.isoformat(), user_id))
+
+
+def access_status(user_id):
+    ensure_trial(user_id)
+    with database() as conn:
+        row = conn.execute("SELECT trial_started_at, expires_at FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
+    expiry = datetime.fromisoformat(row["expires_at"]) if row and row["expires_at"] else None
+    if expiry and expiry > utc_now():
+        trial_start = datetime.fromisoformat(row["trial_started_at"]) if row["trial_started_at"] else None
+        return True, expiry, bool(trial_start and expiry - trial_start <= __import__('datetime').timedelta(hours=TRIAL_HOURS))
+    return False, expiry, False
+
+
+def create_payment_request(user, plan_key):
+    now = utc_now().isoformat()
+    with database() as conn:
+        cur = conn.execute("INSERT INTO payment_requests (user_id, username, plan_key, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+                           (user.id, user.username or '', plan_key, now))
+        return cur.lastrowid
+
+
+def pending_payment_requests():
+    with database() as conn:
+        return conn.execute("SELECT * FROM payment_requests WHERE status='pending' ORDER BY id").fetchall()
+
+
+def process_payment_request(request_id, approve, owner_id):
+    now = utc_now()
+    with database() as conn:
+        req = conn.execute("SELECT * FROM payment_requests WHERE id=? AND status='pending'", (request_id,)).fetchone()
+        if not req:
+            return None
+        status = 'approved' if approve else 'rejected'
+        conn.execute("UPDATE payment_requests SET status=?, processed_at=?, processed_by=? WHERE id=?",
+                     (status, now.isoformat(), owner_id, request_id))
+        if approve:
+            days = PLANS[req['plan_key']][2]
+            row = conn.execute("SELECT expires_at FROM subscriptions WHERE user_id=?", (req['user_id'],)).fetchone()
+            current_expiry = datetime.fromisoformat(row['expires_at']) if row and row['expires_at'] else None
+            base = current_expiry if current_expiry and current_expiry > now else now
+            expiry = base + __import__('datetime').timedelta(days=days)
+            conn.execute("INSERT INTO subscriptions (user_id, trial_started_at, expires_at, updated_at) VALUES (?, NULL, ?, ?) "
+                         "ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, updated_at=excluded.updated_at",
+                         (req['user_id'], expiry.isoformat(), now.isoformat()))
+        return dict(req)
+
+
+def plans_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("7 дней — 34 GRAM", callback_data="buy_week")],
+        [InlineKeyboardButton("1 месяц — 94 GRAM", callback_data="buy_month")],
+        [InlineKeyboardButton("1 год — 794 GRAM", callback_data="buy_year")],
+        [InlineKeyboardButton("💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
+    ])
+
+
+def access_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Выбрать тариф", callback_data="plans")],
+                                 [InlineKeyboardButton("💬 Написать в поддержку", url=f"https://t.me/{SUPPORT_USERNAME}")]])
 
 
 def save_history(gift, model, floor):
@@ -926,6 +1028,8 @@ def menu():
             InlineKeyboardButton("📈 История", callback_data="history"),
             InlineKeyboardButton("🔔 Уведомления", callback_data="alerts"),
         ],
+        [InlineKeyboardButton("💎 Тарифы", callback_data="plans"),
+         InlineKeyboardButton("🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
         [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
     ])
 
@@ -936,12 +1040,22 @@ def menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    user_id = update.effective_user.id
+    was_new = False
+    with database() as conn:
+        was_new = conn.execute("SELECT 1 FROM subscriptions WHERE user_id=?", (user_id,)).fetchone() is None
+    ensure_trial(user_id)
+    active, expiry, is_trial = access_status(user_id)
+    access_line = (f"Пробный доступ активен до {expiry.astimezone().strftime('%d.%m.%Y %H:%M')}." if active and is_trial
+                   else f"Доступ активен до {expiry.astimezone().strftime('%d.%m.%Y %H:%M')}." if active
+                   else "Пробный период завершён. Выбери тариф для продолжения.")
 
     await update.message.reply_text(
         "💎 GIFTS HUNTER\n"
         "Анализ рынка Telegram-подарков\n\n"
+        f"{access_line}\n\n"
         "Выбери инструмент в меню ниже:",
-        reply_markup=menu()
+        reply_markup=menu() if active else access_keyboard()
     )
 
 
@@ -1393,6 +1507,10 @@ async def post_shutdown(application):
 # =====================================
 
 async def alert_command(update, context):
+    active, _expiry, _trial = access_status(update.effective_user.id)
+    if not active:
+        await update.message.reply_text("⏳ Доступ неактивен. Выбери тариф для продолжения.", reply_markup=access_keyboard())
+        return
     context.user_data["mode"] = "alert"
 
     await update.message.reply_text(
@@ -1407,6 +1525,10 @@ async def alert_command(update, context):
 
 
 async def alerts_command(update, context):
+    active, _expiry, _trial = access_status(update.effective_user.id)
+    if not active:
+        await update.message.reply_text("⏳ Доступ неактивен. Выбери тариф для продолжения.", reply_markup=access_keyboard())
+        return
     await show_alerts(update.message, update.effective_chat.id)
 
 
@@ -1429,6 +1551,19 @@ async def delalert_command(update, context):
         await update.message.reply_text("Уведомление не найдено.")
 
 
+
+async def admin_command(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+    requests = pending_payment_requests()
+    if not requests:
+        await update.message.reply_text("📭 Нет ожидающих заявок.")
+        return
+    for req in requests:
+        plan_name, price, _days = PLANS[req['plan_key']]
+        await update.message.reply_text(f"🧾 Заявка №{req['id']}\nПользователь: @{req['username'] or 'без username'}\nID: {req['user_id']}\nТариф: {plan_name} — {price} GRAM", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить", callback_data=f"pay_approve_{req['id']}"), InlineKeyboardButton("❌ Отклонить", callback_data=f"pay_reject_{req['id']}")]]))
+
 async def refresh_command(update, context):
     context.user_data["mode"] = "price"
 
@@ -1448,6 +1583,48 @@ async def buttons(update, context):
     await query.answer()
 
     action = query.data
+
+    if action in {"top", "portals_number", "price", "compare", "fast_flip", "rare", "history", "alerts"}:
+        active, _expiry, _trial = access_status(query.from_user.id)
+        if not active:
+            await query.message.reply_text("⏳ Твой пробный период завершён или подписка неактивна. Выбери тариф для продолжения.", reply_markup=access_keyboard())
+            return
+
+    if action == "plans":
+        await query.message.reply_text("💎 ТАРИФЫ GIFTS HUNTER\n\n7 дней — 34 GRAM\n1 месяц — 94 GRAM\n1 год — 794 GRAM\n\nОплата вручную через поддержку. После согласования ты отправляешь оплату, а владелец подтверждает её в боте.", reply_markup=plans_keyboard())
+        return
+
+    if action.startswith("buy_"):
+        plan_key = action[4:]
+        if plan_key not in PLANS:
+            return
+        user = query.from_user
+        req_id = create_payment_request(user, plan_key)
+        plan_name, price, _days = PLANS[plan_key]
+        await query.message.reply_text(f"✅ Заявка №{req_id} создана.\nТариф: {plan_name}\nСтоимость: {price} GRAM\n\nНапиши в поддержку @{SUPPORT_USERNAME}, чтобы получить инструкции по ручной оплате. После оплаты владелец проверит поступление и активирует доступ.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Открыть поддержку", url=f"https://t.me/{SUPPORT_USERNAME}")]]))
+        try:
+            await context.bot.send_message(OWNER_ID, f"🧾 Новая заявка на оплату №{req_id}\nПользователь: {user.full_name} (@{user.username or 'без username'})\nID: {user.id}\nТариф: {plan_name} — {price} GRAM", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить", callback_data=f"pay_approve_{req_id}"), InlineKeyboardButton("❌ Отклонить", callback_data=f"pay_reject_{req_id}")]]))
+        except Exception:
+            logger.exception("Could not notify owner about payment request")
+        return
+
+    if action.startswith("pay_approve_") or action.startswith("pay_reject_"):
+        if query.from_user.id != OWNER_ID:
+            await query.answer("Нет доступа", show_alert=True)
+            return
+        approve = action.startswith("pay_approve_")
+        request_id = int(action.rsplit("_", 1)[1])
+        req = process_payment_request(request_id, approve, query.from_user.id)
+        if not req:
+            await query.message.reply_text("Заявка уже обработана или не найдена.")
+            return
+        plan_name = PLANS[req['plan_key']][0]
+        await query.message.reply_text(f"{'✅ Оплата подтверждена' if approve else '❌ Заявка отклонена'}: №{request_id} ({plan_name}).")
+        try:
+            await context.bot.send_message(req['user_id'], "✅ Оплата подтверждена! Доступ активирован." if approve else "❌ Заявка на оплату отклонена. Если это ошибка, свяжись с поддержкой.", reply_markup=menu() if approve else access_keyboard())
+        except Exception:
+            logger.exception("Could not notify user about payment decision")
+        return
 
     if action == "top":
         context.user_data["mode"] = None
@@ -1523,6 +1700,13 @@ async def buttons(update, context):
 
 async def text_handler(update, context):
     mode = context.user_data.get("mode")
+
+    if mode in {"price", "compare", "rare", "history", "portals_number", "fast_flip_budget"}:
+        active, _expiry, _trial = access_status(update.effective_user.id)
+        if not active:
+            context.user_data["mode"] = None
+            await update.message.reply_text("⏳ Доступ неактивен. Выбери тариф для продолжения.", reply_markup=access_keyboard())
+            return
 
     if not mode:
         await update.message.reply_text(
@@ -1620,6 +1804,7 @@ def main():
     app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("delalert", delalert_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
+    app.add_handler(CommandHandler("admin", admin_command))
 
     app.add_handler(CallbackQueryHandler(buttons))
 
