@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import quote, urlencode
 from urllib.error import HTTPError, URLError
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -121,6 +121,16 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT DEFAULT '',
+                kind TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
 
         conn.commit()
 
@@ -221,8 +231,12 @@ def purchase_info_text():
 
 
 def access_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("💎 Выбрать тариф", callback_data="plans")],
-                                 [InlineKeyboardButton("💬 Поддержка", callback_data="support")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 Выбрать тариф", callback_data="plans")],
+        [InlineKeyboardButton("💬 Поддержка", callback_data="support")],
+        [InlineKeyboardButton("⭐ Отзывы", callback_data="reviews"),
+         InlineKeyboardButton("💡 Предложить улучшение", callback_data="suggest")],
+    ])
 
 
 def support_entry_keyboard():
@@ -1078,6 +1092,8 @@ def menu():
         ],
         [InlineKeyboardButton("💎 Тарифы", callback_data="plans"),
          InlineKeyboardButton("🆘 Поддержка", callback_data="support")],
+        [InlineKeyboardButton("⭐ Отзывы", callback_data="reviews"),
+         InlineKeyboardButton("💡 Предложить улучшение", callback_data="suggest")],
         [InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
     ])
 
@@ -1094,9 +1110,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         was_new = conn.execute("SELECT 1 FROM subscriptions WHERE user_id=?", (user_id,)).fetchone() is None
     ensure_trial(user_id)
     active, expiry, is_trial = access_status(user_id)
-    access_line = (f"Пробный доступ активен до {expiry.astimezone().strftime('%d.%m.%Y %H:%M')}." if active and is_trial
-                   else f"Доступ активен до {expiry.astimezone().strftime('%d.%m.%Y %H:%M')}." if active
-                   else "Пробный период завершён. Выбери тариф для продолжения.")
+    if user_id == OWNER_ID:
+        access_line = "Бессрочный доступ владельца активен."
+    elif active and is_trial:
+        access_line = f"Пробный доступ активен до {expiry.astimezone().strftime('%d.%m.%Y %H:%M')}."
+    elif active:
+        access_line = f"Доступ активен до {expiry.astimezone().strftime('%d.%m.%Y %H:%M')}."
+    else:
+        access_line = "Пробный период завершён. Выбери тариф для продолжения."
 
     await update.message.reply_text(
         "💎 GIFTS HUNTER\n"
@@ -1116,7 +1137,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/delalert ID — удалить уведомление\n"
         "/refresh — обновить цену\n"
         "FAST FLIP — анализ объявлений и глубины рынка Portals\n"
-        "/help — помощь\n\n"
+        "/help — помощь\n"
+        "/feedbacks — отзывы и предложения (только владелец)\n\n"
         "Поиск Portals по номеру:\n"
         "1234 — по всем коллекциям\n"
         "Plush Pepe / 1234 — в конкретной коллекции\n\n"
@@ -1533,6 +1555,15 @@ async def monitor_alerts(application):
 
 
 async def post_init(application):
+    # Показываем стандартные команды в меню Telegram у всех пользователей.
+    await application.bot.set_my_commands([
+        BotCommand("start", "Запустить бота и открыть главное меню"),
+        BotCommand("help", "Помощь"),
+        BotCommand("alert", "Создать уведомление"),
+        BotCommand("alerts", "Мои уведомления"),
+        BotCommand("delalert", "Удалить уведомление"),
+        BotCommand("refresh", "Обновить цену"),
+    ])
     application.bot_data["monitor_task"] = asyncio.create_task(
         monitor_alerts(application)
     )
@@ -1612,7 +1643,8 @@ async def admin_command(update, context):
         "/grant USER_ID — выдать бессрочный доступ\n"
         "/grant USER_ID DAYS — выдать доступ на N дней\n"
         "/revoke USER_ID — отключить доступ\n\n"
-        f"Ожидающих заявок на оплату: {len(requests)}"
+        f"Ожидающих заявок на оплату: {len(requests)}\n"
+        "/feedbacks — последние отзывы и предложения пользователей"
     )
     for req in requests:
         plan_name, price, _days = PLANS[req['plan_key']]
@@ -1694,6 +1726,27 @@ async def revoke_command(update, context):
     except Exception:
         logger.info("Could not notify user %s about revoked access", target_id)
 
+async def feedbacks_command(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+    with database() as conn:
+        rows = conn.execute(
+            "SELECT id, user_id, username, kind, message, created_at FROM user_feedback ORDER BY id DESC LIMIT 15"
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("Пока отзывов и предложений нет.")
+        return
+    labels = {"review": "⭐ Отзыв", "suggestion": "💡 Предложение"}
+    for row in rows:
+        username = f"@{row['username']}" if row['username'] else "без username"
+        await update.message.reply_text(
+            f"{labels.get(row['kind'], 'Сообщение')} №{row['id']}\n"
+            f"Пользователь: {username}\nID: {row['user_id']}\n"
+            f"Дата: {row['created_at']}\n\n{row['message']}"
+        )
+
+
 async def refresh_command(update, context):
     context.user_data["mode"] = "price"
 
@@ -1719,6 +1772,43 @@ async def buttons(update, context):
         if not active:
             await query.message.reply_text("⏳ Твой пробный период завершён или подписка неактивна. Выбери тариф для продолжения.", reply_markup=access_keyboard())
             return
+
+    if action == "reviews":
+        with database() as conn:
+            rows = conn.execute(
+                "SELECT message, created_at FROM user_feedback WHERE kind='review' ORDER BY id DESC LIMIT 5"
+            ).fetchall()
+        if rows:
+            lines = ["⭐ ОТЗЫВЫ ПОЛЬЗОВАТЕЛЕЙ\n"]
+            for row in rows:
+                lines.append(f"• {row['message'][:500]}")
+            review_text = "\n\n".join(lines)
+        else:
+            review_text = "⭐ ОТЗЫВЫ\n\nПока отзывов нет. Будь первым!"
+        await query.message.reply_text(
+            review_text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✍️ Оставить отзыв", callback_data="review_write")],
+                [InlineKeyboardButton("↩️ Главное меню", callback_data="support_home")],
+            ])
+        )
+        return
+
+    if action == "review_write":
+        context.user_data["mode"] = "feedback_review"
+        await query.message.reply_text(
+            "⭐ Напиши свой отзыв о GIFTS HUNTER одним сообщением.\n"
+            "Отзыв будет опубликован в разделе отзывов. Не указывай личные данные."
+        )
+        return
+
+    if action == "suggest":
+        context.user_data["mode"] = "feedback_suggestion"
+        await query.message.reply_text(
+            "💡 Что нам улучшить или добавить в GIFTS HUNTER?\n\n"
+            "Напиши идею одним сообщением — она уйдёт владельцу бота."
+        )
+        return
 
     if action == "plans":
         await query.message.reply_text(
@@ -1924,6 +2014,45 @@ async def text_handler(update, context):
 
     text = update.message.text.strip()
 
+    if mode in {"feedback_review", "feedback_suggestion"}:
+        if not text.strip():
+            await update.message.reply_text("Сообщение пустое. Напиши отзыв или предложение текстом.")
+            return
+        if len(text) > 2000:
+            await update.message.reply_text("Слишком длинное сообщение. Максимум 2000 символов.")
+            return
+        kind = "review" if mode == "feedback_review" else "suggestion"
+        user = update.effective_user
+        created_at = utc_now().isoformat()
+        with database() as conn:
+            cur = conn.execute(
+                "INSERT INTO user_feedback (user_id, username, kind, message, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user.id, user.username or "", kind, text, created_at)
+            )
+            feedback_id = cur.lastrowid
+        context.user_data["mode"] = None
+        if kind == "review":
+            await update.message.reply_text(
+                "Спасибо! ⭐ Твой отзыв сохранён и появился в разделе «Отзывы».",
+                reply_markup=menu()
+            )
+            owner_note = "⭐ Новый отзыв"
+        else:
+            await update.message.reply_text(
+                "Спасибо за идею! 💡 Я передал предложение владельцу GIFTS HUNTER.",
+                reply_markup=menu()
+            )
+            owner_note = "💡 Новое предложение по улучшению"
+        try:
+            await context.bot.send_message(
+                OWNER_ID,
+                f"{owner_note} №{feedback_id}\nПользователь: {user.full_name} (@{user.username or 'без username'})\n"
+                f"ID: {user.id}\n\n{text}"
+            )
+        except Exception:
+            logger.exception("Could not notify owner about user feedback")
+        return
+
     if mode == "alert":
         context.user_data["mode"] = None
         await create_alert_from_text(update, text)
@@ -2014,6 +2143,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("grant", grant_command))
     app.add_handler(CommandHandler("revoke", revoke_command))
+    app.add_handler(CommandHandler("feedbacks", feedbacks_command))
 
     app.add_handler(CallbackQueryHandler(buttons))
 
