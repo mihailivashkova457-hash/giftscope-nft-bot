@@ -131,6 +131,9 @@ def utc_now():
 
 
 def ensure_trial(user_id):
+    # The owner always has permanent access and never receives a trial record.
+    if int(user_id) == OWNER_ID:
+        return
     now = utc_now()
     with database() as conn:
         row = conn.execute("SELECT * FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
@@ -144,6 +147,9 @@ def ensure_trial(user_id):
 
 
 def access_status(user_id):
+    # Owner bypass: lifetime access, independent of trial/subscription expiry.
+    if int(user_id) == OWNER_ID:
+        return True, None, False
     ensure_trial(user_id)
     with database() as conn:
         row = conn.execute("SELECT trial_started_at, expires_at FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
@@ -1599,12 +1605,94 @@ async def admin_command(update, context):
         await update.message.reply_text("Нет доступа.")
         return
     requests = pending_payment_requests()
-    if not requests:
-        await update.message.reply_text("📭 Нет ожидающих заявок.")
-        return
+    await update.message.reply_text(
+        "🛠 ПАНЕЛЬ ВЛАДЕЛЬЦА\n\n"
+        "Твой аккаунт: бессрочный доступ.\n\n"
+        "Управление подписками:\n"
+        "/grant USER_ID — выдать бессрочный доступ\n"
+        "/grant USER_ID DAYS — выдать доступ на N дней\n"
+        "/revoke USER_ID — отключить доступ\n\n"
+        f"Ожидающих заявок на оплату: {len(requests)}"
+    )
     for req in requests:
         plan_name, price, _days = PLANS[req['plan_key']]
-        await update.message.reply_text(f"🧾 Заявка №{req['id']}\nПользователь: @{req['username'] or 'без username'}\nID: {req['user_id']}\nТариф: {plan_name} — {price} GRAM", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить", callback_data=f"pay_approve_{req['id']}"), InlineKeyboardButton("❌ Отклонить", callback_data=f"pay_reject_{req['id']}")]]))
+        await update.message.reply_text(
+            f"🧾 Заявка №{req['id']}\nПользователь: @{req['username'] or 'без username'}\n"
+            f"ID: {req['user_id']}\nТариф: {plan_name} — {price} GRAM",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Подтвердить", callback_data=f"pay_approve_{req['id']}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"pay_reject_{req['id']}")
+            ]])
+        )
+
+
+async def grant_command(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+    if not context.args or len(context.args) > 2:
+        await update.message.reply_text("Использование: /grant USER_ID [DAYS]\nБез DAYS выдаётся бессрочный доступ.")
+        return
+    try:
+        target_id = int(context.args[0])
+        if target_id <= 0:
+            raise ValueError
+        days = int(context.args[1]) if len(context.args) == 2 else None
+        if days is not None and not 1 <= days <= 36500:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Неверные данные. Пример: /grant 123456789 или /grant 123456789 30")
+        return
+    if target_id == OWNER_ID:
+        await update.message.reply_text("У владельца уже бессрочный доступ.")
+        return
+    now = utc_now()
+    expiry = (now + __import__('datetime').timedelta(days=days)).isoformat() if days else "9999-12-31T23:59:59+00:00"
+    with database() as conn:
+        conn.execute(
+            "INSERT INTO subscriptions (user_id, trial_started_at, expires_at, updated_at) VALUES (?, NULL, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET trial_started_at=NULL, expires_at=excluded.expires_at, updated_at=excluded.updated_at",
+            (target_id, expiry, now.isoformat())
+        )
+    label = f"на {days} дн." if days else "бессрочно"
+    await update.message.reply_text(f"✅ Пользователю {target_id} выдан доступ {label}.")
+    try:
+        await context.bot.send_message(target_id, f"🎉 Тебе выдан доступ к {PRODUCT_NAME} {label}.")
+    except Exception:
+        logger.info("Could not notify user %s about granted access", target_id)
+
+
+async def revoke_command(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Использование: /revoke USER_ID")
+        return
+    try:
+        target_id = int(context.args[0])
+        if target_id <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("USER_ID должен быть положительным числом.")
+        return
+    if target_id == OWNER_ID:
+        await update.message.reply_text("Нельзя отключить бессрочный доступ владельца.")
+        return
+    now = utc_now()
+    with database() as conn:
+        row = conn.execute("SELECT trial_started_at FROM subscriptions WHERE user_id=?", (target_id,)).fetchone()
+        trial_started = row["trial_started_at"] if row and row["trial_started_at"] else now.isoformat()
+        conn.execute(
+            "INSERT INTO subscriptions (user_id, trial_started_at, expires_at, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at, updated_at=excluded.updated_at",
+            (target_id, trial_started, (now - __import__('datetime').timedelta(seconds=1)).isoformat(), now.isoformat())
+        )
+    await update.message.reply_text(f"⛔ Доступ пользователя {target_id} отключён.")
+    try:
+        await context.bot.send_message(target_id, f"⛔ Доступ к {PRODUCT_NAME} отключён владельцем.")
+    except Exception:
+        logger.info("Could not notify user %s about revoked access", target_id)
 
 async def refresh_command(update, context):
     context.user_data["mode"] = "price"
@@ -1924,6 +2012,8 @@ def main():
     app.add_handler(CommandHandler("delalert", delalert_command))
     app.add_handler(CommandHandler("refresh", refresh_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("grant", grant_command))
+    app.add_handler(CommandHandler("revoke", revoke_command))
 
     app.add_handler(CallbackQueryHandler(buttons))
 
